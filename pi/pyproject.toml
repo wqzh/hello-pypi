@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+# Note: setuptools is installed by default if Python <= 3.11
+# Otherwise, it needs Internet access to download setuptools.
+
+[project]
+name = "pi"
+version = "0.84.1"
+description = "Python port of @earendil-works/pi"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/earendil-works/pi"
+
+[tool.setuptools.packages.find]
+include = ["pi*", "pi.*"]

@@ -1,0 +1,759 @@
+"""OpenAI Chat Completions provider。
+
+对应上游 ``api/openai-completions.ts``（48KB 的核心文件）。Python 版聚焦
+Chat Completions 协议（覆盖 OpenAI 及大量兼容厂商）。
+
+核心机制（务必与上游一致）：
+1. ``AsyncOpenAI`` 客户端，``max_retries=0``（重试是外层关注点）。
+2. **工具调用累加**：按 ``delta.index`` 和 ``delta.id`` 双索引，原始参数 JSON
+   字符串拼接进 ``partial_args``，**每个增量重新解析**（用 ``json-repair``
+   容忍不完整 JSON）。
+3. **文本/思考是单槽位**：同一时间只有一个激活的 text 块和一个 thinking 块。
+4. **usage 在 chunk 级别**提取（``stream_options={"include_usage": True}``）。
+5. **错误不内联重试**：编码为 error 事件（``stopReason="error"`` + ``errorMessage``）。
+6. **终止判定**：``finish_reason`` 缺失默认视为异常；但对声明
+   ``compat.supportsFinishReason=False`` 的兼容端点（不发 finish_reason），
+   流结束时按内容推断 ``stop``/``toolUse``。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from typing import Any
+
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
+
+from ..constrained_sampling import (
+    GrammarToolInputJsonBuffer,
+    append_grammar_tool_input_json_delta,
+    create_grammar_tool_input_properties,
+    get_grammar_tool_input,
+    resolve_grammar_constrained_sampling,
+    resolve_json_schema_strict_sampling,
+)
+from ..event_stream import EventStream
+from ..events import (
+    AssistantMessageEvent,
+    DoneEvent,
+    ErrorEvent,
+    StartEvent,
+    TextDeltaEvent,
+    TextEndEvent,
+    TextStartEvent,
+    ThinkingDeltaEvent,
+    ThinkingEndEvent,
+    ThinkingStartEvent,
+    ToolCallDeltaEvent,
+    ToolCallEndEvent,
+    ToolCallStartEvent,
+)
+from ..provider_retry import retry_provider_request
+from ..types import (
+    AssistantMessage,
+    Context,
+    Model,
+    SimpleStreamOptions,
+    StopReason,
+    StreamOptions,
+    TextContent,
+    ThinkingContent,
+    ToolCall,
+    ToolResultMessage,
+    Usage,
+    UsageCost,
+    UserMessage,
+)
+
+#: 思考内容可能的字段名（不同厂商差异），第一个非空者胜出。
+_THINKING_FIELDS = ("reasoning_content", "reasoning", "reasoning_text")
+
+#: OpenAI finish_reason -> pi StopReason
+_STOP_REASON_MAP: dict[str, StopReason] = {
+    "stop": "stop",
+    "end_turn": "stop",
+    "length": "length",
+    "tool_calls": "toolUse",
+    "function_call": "toolUse",
+    "content_filter": "error",
+    "network_error": "error",
+}
+
+#: 当 thinking 预算与答案共享响应上限时，始终为答案保留的 token 数。
+#: 对应上游 ``simple-options.ts`` 的 ``MIN_ANSWER_TOKENS``。
+_MIN_ANSWER_TOKENS = 1024
+
+#: 默认 thinking token 预算（按 reasoning level）。对应上游
+#: ``support thinking_token_budget`` 的内置预算。
+_DEFAULT_THINKING_BUDGETS: dict[str, int] = {
+    "minimal": 1024,
+    "low": 2048,
+    "medium": 8192,
+    "high": 16384,
+}
+
+
+def _clamp_reasoning(level: str) -> str:
+    """把 ``xhigh``/``max`` 折叠为 ``high``（预算表只覆盖到 high）。对应上游 ``clampReasoning``。"""
+    return "high" if level in ("xhigh", "max") else level
+
+
+# ============================================================
+# 流式增量解析的块状态
+# ============================================================
+
+
+class _ToolCallBlock:
+    """工具调用的流式累加状态。
+
+    保留一个放进 ``output.content`` 的真实 ``ToolCall`` 实例（保证 content 始终
+    持有合法模型对象），累加状态（``partial_args``/``stream_index``/``content_index``）
+    仅解析期使用。
+    """
+
+    __slots__ = (
+        "tool_call",
+        "partial_args",
+        "stream_index",
+        "content_index",
+        "custom_input_property",
+        "custom_input_buffer",
+    )
+
+    def __init__(
+        self,
+        content_index: int,
+        id: str = "",
+        name: str = "",
+        custom_input_property: str | None = None,
+    ) -> None:
+        self.tool_call = ToolCall(id=id, name=name, arguments={})
+        self.partial_args: str = ""
+        self.stream_index: int | None = None
+        self.content_index = content_index
+        self.custom_input_property = custom_input_property
+        self.custom_input_buffer = (
+            GrammarToolInputJsonBuffer() if custom_input_property is not None else None
+        )
+        if custom_input_property is not None:
+            self.tool_call.arguments = {custom_input_property: ""}
+
+
+# ============================================================
+# usage 解析
+# ============================================================
+
+
+def _parse_chunk_usage(raw: Any, model: Model) -> Usage:
+    """从 OpenAI chunk usage 提取 token 统计。对应上游 ``parseChunkUsage``。
+
+    注意：SDK 对象的属性可能存在但值为 None（如 DeepSeek 的 cache_write_tokens=None），
+    故所有字段统一 ``or 0`` 兜底，避免 ``int - None`` 崩溃。
+    """
+    prompt_tokens = getattr(raw, "prompt_tokens", 0) or 0
+    ptd = getattr(raw, "prompt_tokens_details", None)
+    cached = getattr(ptd, "cached_tokens", None) if ptd else None
+    cache_read = (cached or getattr(raw, "prompt_cache_hit_tokens", 0) or 0) or 0
+    cache_write = (getattr(ptd, "cache_write_tokens", 0) if ptd else 0) or 0
+
+    # cached_tokens 是缓存"读取"命中，不减去；input 扣除缓存部分使恒等式成立
+    input_tokens = max(0, prompt_tokens - cache_read - cache_write)
+    output_tokens = getattr(raw, "completion_tokens", 0) or 0
+    ctd = getattr(raw, "completion_tokens_details", None)
+    reasoning = (getattr(ctd, "reasoning_tokens", 0) if ctd else 0) or 0
+
+    total = input_tokens + output_tokens + cache_read + cache_write
+    usage = Usage(
+        input=input_tokens,
+        output=output_tokens,
+        cache_read=cache_read,
+        cache_write=cache_write,
+        reasoning=reasoning or None,
+        total_tokens=total,
+    )
+    _apply_cost(usage, model)
+    return usage
+
+
+def _apply_cost(usage: Usage, model: Model) -> None:
+    """按 model.cost 费率计算 cost。"""
+    rates = model.cost
+    # 每百万 token -> 每 token
+    per_million = 1_000_000
+    c = UsageCost(
+        input=usage.input * rates.input / per_million,
+        output=usage.output * rates.output / per_million,
+        cache_read=usage.cache_read * rates.cache_read / per_million,
+        cache_write=usage.cache_write * rates.cache_write / per_million,
+    )
+    c.total = c.input + c.output + c.cache_read + c.cache_write
+    usage.cost = c
+
+
+# ============================================================
+# 主流式函数
+# ============================================================
+
+
+def _create_client(
+    model: Model,
+    api_key: str,
+    options_headers: dict[str, str | None] | None,
+    http_client: Any = None,
+) -> AsyncOpenAI:
+    headers: dict[str, Any] = dict(model.headers or {})
+    if options_headers:
+        headers.update(options_headers)
+    return AsyncOpenAI(
+        api_key=api_key,
+        base_url=model.base_url,
+        default_headers=headers or None,
+        max_retries=0,
+        http_client=http_client,
+    )
+
+
+def _convert_tools(
+    tools: list[Any],
+    *,
+    supports_strict_mode: bool = True,
+    supports_openai_grammar_tools: bool = False,
+) -> list[dict[str, Any]]:
+    """ToolDef 列表 -> OpenAI tools 格式。"""
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        grammar = resolve_grammar_constrained_sampling(tool, supports_openai_grammar_tools)
+        if grammar is not None:
+            converted.append(
+                {
+                    "type": "custom",
+                    "custom": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "format": {
+                            "type": "grammar",
+                            "grammar": {
+                                "syntax": grammar.format,
+                                "definition": grammar.definition,
+                            },
+                        },
+                    },
+                }
+            )
+            continue
+        strict = resolve_json_schema_strict_sampling(tool, supports_strict_mode)
+        function = {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": (
+                tool.to_json_schema() if hasattr(tool, "to_json_schema") else tool.parameters
+            ),
+        }
+        if supports_strict_mode:
+            function["strict"] = strict if strict is not None else False
+        converted.append({"type": "function", "function": function})
+    return converted
+
+
+def _convert_messages(
+    context: Context,
+    grammar_tool_input_properties: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str] | None]:
+    """Context.messages -> OpenAI messages。返回 (messages, dev_headers)。"""
+    out: list[dict[str, Any]] = []
+    # 系统提示
+    if context.system_prompt:
+        out.append({"role": "system", "content": context.system_prompt})
+
+    for msg in context.messages:
+        if isinstance(msg, UserMessage):
+            content = msg.content
+            if isinstance(content, str):
+                out.append({"role": "user", "content": content})
+            else:
+                # 内容块数组 -> OpenAI 多模态格式
+                parts: list[dict[str, Any]] = []
+                for block in content:
+                    if block.type == "text":
+                        parts.append({"type": "text", "text": block.text})
+                    elif block.type == "image":
+                        img: dict[str, Any] = {"url": f"data:{block.mime_type};base64,{block.data}"}
+                        parts.append({"type": "image_url", "image_url": img})
+                out.append({"role": "user", "content": parts})
+        elif isinstance(msg, AssistantMessage):
+            # 文本 + thinking -> content；tool_calls 单独。
+            # 注：pydantic-mypy 插件对 Annotated 判别联合的 content 字段解析有偏差，
+            # 故用 __dict__ 直取绕过，运行时类型仍由 isinstance 保证。
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            for block in msg.__dict__["content"]:
+                if isinstance(block, TextContent):
+                    # 收集文本内容
+                    if block.text:
+                        text_parts.append(block.text)
+                elif isinstance(block, ThinkingContent):
+                    # OpenAI 原生 thinking models 需要 reasoning_block，
+                    # 但兼容 API（如 Ollama）通常不支持，转为文本注释保留在历史中
+                    if block.thinking and not block.redacted:
+                        text_parts.append(f"<thinking>{block.thinking}</thinking>")
+                elif isinstance(block, ToolCall):
+                    input_property = (grammar_tool_input_properties or {}).get(block.name)
+                    if input_property is not None:
+                        tool_calls.append(
+                            {
+                                "id": block.id,
+                                "type": "custom",
+                                "custom": {
+                                    "name": block.name,
+                                    "input": get_grammar_tool_input(
+                                        block.name, block.arguments, input_property
+                                    ),
+                                },
+                            }
+                        )
+                    else:
+                        tool_calls.append(
+                            {
+                                "id": block.id,
+                                "type": "function",
+                                "function": {
+                                    "name": block.name,
+                                    "arguments": json.dumps(block.arguments),
+                                },
+                            }
+                        )
+            entry: dict[str, Any] = {"role": "assistant"}
+            if text_parts:
+                entry["content"] = "\n".join(text_parts)
+            elif tool_calls:
+                # 只有 tool_calls 时，content 可以为 null
+                entry["content"] = None
+            if tool_calls:
+                entry["tool_calls"] = tool_calls
+            out.append(entry)
+        elif isinstance(msg, ToolResultMessage):
+            text = "\n".join(b.text for b in msg.content if b.type == "text")
+            out.append(
+                {
+                    "role": "tool",
+                    "content": text or "",
+                    "tool_call_id": msg.tool_call_id,
+                }
+            )
+    return out, None
+
+
+def _parse_streaming_json(s: str) -> dict[str, Any]:
+    """容错解析不完整的 JSON 字符串。对应上游 ``parseStreamingJson``。"""
+    if not s:
+        return {}
+    try:
+        result: dict[str, Any] = json.loads(s)
+        return result
+    except Exception:
+        pass
+    try:
+        from json_repair import repair_json
+
+        repaired = repair_json(s, return_objects=True)
+        return repaired if isinstance(repaired, dict) else {}
+    except Exception:
+        return {}
+
+
+def _run_openai_stream(
+    model: Model,
+    context: Context,
+    options: StreamOptions | None,
+) -> EventStream[AssistantMessageEvent, AssistantMessage]:
+    es: EventStream[AssistantMessageEvent, AssistantMessage] = EventStream()
+    api_key = (options.api_key if options else None) or _resolve_api_key()
+
+    async def drive() -> None:
+        output = AssistantMessage(
+            api=model.api,
+            provider=model.provider,
+            model=model.id,
+            stop_reason="pending",
+            timestamp=int(time.time() * 1000),
+        )
+        es.push(StartEvent(partial=output.model_copy(deep=True)))
+        client = _create_client(
+            model,
+            api_key,
+            options.headers if options else None,
+            options.http_client if options else None,
+        )
+
+        # 构建请求参数
+        compat = model.compat or {}
+        grammar_tool_input_properties = create_grammar_tool_input_properties(
+            context.tools,
+            compat.get("supportsOpenAIGrammarTools", False),
+        )
+        messages, _ = _convert_messages(context, grammar_tool_input_properties)
+        params: dict[str, Any] = {
+            "model": model.id,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if context.tools:
+            params["tools"] = _convert_tools(
+                context.tools,
+                supports_strict_mode=compat.get("supportsStrictMode", True),
+                supports_openai_grammar_tools=compat.get("supportsOpenAIGrammarTools", False),
+            )
+        if options and options.temperature is not None:
+            params["temperature"] = options.temperature
+        if options and options.max_tokens is not None:
+            # 优先 max_completion_tokens，回退 max_tokens
+            params["max_tokens"] = options.max_tokens
+        if options and options.timeout_ms is not None:
+            params["timeout"] = options.timeout_ms / 1000
+
+        # thinking_token_budget（vLLM 等）：推理与答案共享 max_tokens，不设上限时
+        # 一次推理密集的轮次可能耗尽整个响应、既无答案也无工具调用。
+        # 仅当 compat.supportsThinkingTokenBudget 为真时生效；与 thinkingFormat
+        # 无关（同一台服务器可同时服务 zai/qwen/chat-template 模型）。
+        reasoning_effort = getattr(options, "reasoning", None) if options else None
+        if compat.get("supportsThinkingTokenBudget") and reasoning_effort and model.reasoning:
+            level = _clamp_reasoning(reasoning_effort)
+            custom = getattr(options, "thinking_budgets", None) or {}
+            budgets = {**_DEFAULT_THINKING_BUDGETS, **custom}
+            ceiling = params.get("max_tokens") or model.max_tokens
+            budget = min(budgets.get(level, 0), max(0, ceiling - _MIN_ANSWER_TOKENS))
+            if budget > 0:
+                params["thinking_token_budget"] = budget
+
+        # 泛型采样参数：放在具名字段之后，使自定义键覆盖它们（如 llama.cpp/vLLM/
+        # SGLang 的 top_p/top_k/min_p/repetition_penalty）。模型级按 key 被请求级覆盖。
+        if model.sampling_params:
+            params.update(model.sampling_params)
+        if options and options.sampling_params:
+            params.update(options.sampling_params)
+
+        # 流式块状态：用真实模型实例累加，保证 output.content 始终持合法对象
+        text_block: TextContent | None = None
+        text_content_idx: int | None = None
+        thinking_block: ThinkingContent | None = None
+        thinking_content_idx: int | None = None
+        has_finish_reason = False
+        tool_blocks_by_index: dict[int, _ToolCallBlock] = {}
+        tool_blocks_by_id: dict[str, _ToolCallBlock] = {}
+
+        def ensure_tool_block(
+            index: int | None,
+            tool_id: str | None,
+            func_name: str | None,
+            custom_input_property: str | None = None,
+        ) -> _ToolCallBlock:
+            block = tool_blocks_by_index.get(index) if index is not None else None
+            if block is None and tool_id:
+                block = tool_blocks_by_id.get(tool_id)
+            if block is None:
+                # 新建：把 ToolCall 实例直接放进 content，记录其索引
+                cidx = len(output.content)
+                block = _ToolCallBlock(
+                    content_index=cidx,
+                    id=tool_id or "",
+                    name=func_name or "",
+                    custom_input_property=custom_input_property,
+                )
+                output.content.append(block.tool_call)
+                if index is not None:
+                    block.stream_index = index
+                    tool_blocks_by_index[index] = block
+                if tool_id:
+                    tool_blocks_by_id[tool_id] = block
+                es.push(ToolCallStartEvent(content_index=cidx, partial=output))
+            if block.stream_index is None and index is not None:
+                block.stream_index = index
+                tool_blocks_by_index[index] = block
+            if not block.tool_call.id and tool_id:
+                block.tool_call.id = tool_id
+                tool_blocks_by_id[tool_id] = block
+            if not block.tool_call.name and func_name:
+                block.tool_call.name = func_name
+            return block
+
+        try:
+            stream_obj = await retry_provider_request(
+                lambda: client.chat.completions.create(**params),
+                max_retries=(options.max_retries or 0) if options else 0,
+                max_retry_delay_ms=options.max_retry_delay_ms if options else None,
+                cancel_event=options.cancel_event if options else None,
+            )
+            async for chunk in stream_obj:
+                # usage（chunk 级）
+                if chunk.usage:
+                    output.usage = _parse_chunk_usage(chunk.usage, model)
+
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+
+                # finish_reason
+                if choice.finish_reason:
+                    output.raw_stop_reason = choice.finish_reason
+                    mapped: StopReason = _STOP_REASON_MAP.get(choice.finish_reason, "error")
+                    output.stop_reason = mapped
+                    if mapped == "error":
+                        output.error_message = f"Unhandled finish_reason: {choice.finish_reason}"
+                    has_finish_reason = True
+
+                # 文本增量（单槽位）
+                delta_content = getattr(delta, "content", None)
+                if delta_content:
+                    if text_block is None:
+                        text_block = TextContent(text="")
+                        text_content_idx = len(output.content)
+                        output.content.append(text_block)
+                        es.push(TextStartEvent(content_index=text_content_idx, partial=output))
+                    text_block.text += delta_content
+                    es.push(
+                        TextDeltaEvent(
+                            content_index=text_content_idx,
+                            delta=delta_content,
+                            partial=output,
+                        )
+                    )
+
+                # 思考增量（三字段名，单槽位）
+                for field in _THINKING_FIELDS:
+                    thinking_val = getattr(delta, field, None)
+                    if thinking_val:
+                        if thinking_block is None:
+                            thinking_block = ThinkingContent(thinking="")
+                            thinking_content_idx = len(output.content)
+                            output.content.append(thinking_block)
+                            es.push(
+                                ThinkingStartEvent(
+                                    content_index=thinking_content_idx, partial=output
+                                )
+                            )
+                        thinking_block.thinking += thinking_val
+                        es.push(
+                            ThinkingDeltaEvent(
+                                content_index=thinking_content_idx,
+                                delta=thinking_val,
+                                partial=output,
+                            )
+                        )
+                        break
+
+                # 工具调用增量（双索引 + 字符串累加 + 每增量重新解析）
+                tool_calls_delta = getattr(delta, "tool_calls", None)
+                if tool_calls_delta:
+                    for tc_delta in tool_calls_delta:
+                        idx = getattr(tc_delta, "index", None)
+                        tc_id = getattr(tc_delta, "id", None)
+                        func = getattr(tc_delta, "function", None)
+                        func_name = getattr(func, "name", None) if func else None
+                        args_chunk = getattr(func, "arguments", None) if func else None
+                        custom = getattr(tc_delta, "custom", None)
+                        custom_name = getattr(custom, "name", None) if custom else None
+                        custom_chunk = getattr(custom, "input", None) if custom else None
+                        tool_name = func_name or custom_name
+                        custom_property = (
+                            grammar_tool_input_properties.get(tool_name or "")
+                            if custom is not None and func is None
+                            else None
+                        )
+
+                        block = ensure_tool_block(
+                            idx, tc_id, tool_name, custom_input_property=custom_property
+                        )
+                        delta_str = ""
+                        if args_chunk:
+                            block.partial_args += args_chunk
+                            block.tool_call.arguments = _parse_streaming_json(block.partial_args)
+                            delta_str = args_chunk
+                        elif custom_chunk and func is None and block.custom_input_property:
+                            current = block.tool_call.arguments[block.custom_input_property]
+                            next_input = str(current) + custom_chunk
+                            buffer = block.custom_input_buffer
+                            assert buffer is not None
+                            delta_str = (
+                                append_grammar_tool_input_json_delta(
+                                    buffer,
+                                    block.custom_input_property,
+                                    next_input,
+                                    close=False,
+                                )
+                                or ""
+                            )
+                            block.tool_call.arguments = {block.custom_input_property: next_input}
+                        es.push(
+                            ToolCallDeltaEvent(
+                                content_index=block.content_index,
+                                delta=delta_str,
+                                partial=output,
+                            )
+                        )
+
+            # ---- 流结束，发各块的 *_end 事件 ----
+            if text_block is not None and text_content_idx is not None:
+                es.push(
+                    TextEndEvent(
+                        content_index=text_content_idx,
+                        content=text_block.text,
+                        partial=output,
+                    )
+                )
+            if thinking_block is not None and thinking_content_idx is not None:
+                es.push(
+                    ThinkingEndEvent(
+                        content_index=thinking_content_idx,
+                        content=thinking_block.thinking,
+                        partial=output,
+                    )
+                )
+            for block in tool_blocks_by_index.values():
+                if block.custom_input_property and block.custom_input_buffer:
+                    input_value = str(block.tool_call.arguments[block.custom_input_property])
+                    closing_delta = append_grammar_tool_input_json_delta(
+                        block.custom_input_buffer,
+                        block.custom_input_property,
+                        input_value,
+                        close=True,
+                    )
+                    if closing_delta:
+                        es.push(
+                            ToolCallDeltaEvent(
+                                content_index=block.content_index,
+                                delta=closing_delta,
+                                partial=output,
+                            )
+                        )
+                es.push(
+                    ToolCallEndEvent(
+                        content_index=block.content_index,
+                        tool_call=block.tool_call,
+                        partial=output,
+                    )
+                )
+
+            # 终止判定（对齐 v0.84.1 supportsFinishReason 语义）
+            supports_finish_reason = compat.get("supportsFinishReason", True)
+            if output.stop_reason == "aborted":
+                raise RuntimeError("Request was aborted")
+            # 声明不发 finish_reason 的兼容端点：按内容推断 stop/toolUse
+            if not has_finish_reason and not supports_finish_reason:
+                output.stop_reason = (
+                    "toolUse" if any(isinstance(b, ToolCall) for b in output.content) else "stop"
+                )
+            if output.stop_reason == "error":
+                raise RuntimeError(output.error_message or "provider error")
+            # 仅当端点本应发 finish_reason 却没发、或仍停在 pending 时才视为异常
+            if (
+                supports_finish_reason and not has_finish_reason
+            ) or output.stop_reason == "pending":
+                raise RuntimeError("Stream ended without finish_reason")
+
+            es.push(DoneEvent(reason=output.stop_reason, message=output))
+            es.end(output)
+
+        except BaseException as exc:  # noqa: BLE001
+            output.stop_reason = "error"
+            output.error_message = _format_error(exc)
+            es.push(ErrorEvent(reason="error", error=output))
+            es.end(output)
+        finally:
+            # 关闭 HTTP 客户端，释放连接池
+            await client.close()
+
+    asyncio.ensure_future(drive())
+    return es
+
+
+def _resolve_api_key() -> str:
+    import os
+
+    key = os.environ.get("OPENAI_API_KEY", "")
+    if not key:
+        raise RuntimeError(
+            "未找到 API key：请在 options.api_key 传入，或设置 OPENAI_API_KEY 环境变量"
+        )
+    return key
+
+
+def _format_error(exc: BaseException) -> str:
+    """格式化 provider 错误。对应上游 ``formatProviderError``。"""
+    if isinstance(exc, APIStatusError):
+        status = exc.status_code
+        try:
+            body = exc.response.text[:4000]
+        except Exception:  # noqa: BLE001
+            body = str(exc)
+        return f"{status}: {body}"
+    if isinstance(exc, APITimeoutError):
+        return f"timeout: {exc}"
+    if isinstance(exc, APIConnectionError):
+        return f"connection error: {exc}"
+    return str(exc)
+
+
+# ============================================================
+# provider 句柄
+# ============================================================
+
+
+class _OpenAIProvider:
+    def stream(
+        self,
+        model: Model,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> EventStream[AssistantMessageEvent, AssistantMessage]:
+        return _run_openai_stream(model, context, options)
+
+    def stream_simple(
+        self,
+        model: Model,
+        context: Context,
+        options: SimpleStreamOptions | None = None,
+    ) -> EventStream[AssistantMessageEvent, AssistantMessage]:
+        return _run_openai_stream(model, context, options)
+
+
+openai_api_provider: Any = _OpenAIProvider()
+
+
+# ============================================================
+# 内置 OpenAI 模型（精简，后续由配置/生成补充）
+# ============================================================
+
+from ..types import ModelCost  # noqa: E402
+
+OPENAI_MODELS: list[Model] = [
+    Model(
+        id="gpt-4o",
+        name="GPT-4o",
+        api="openai-completions",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        reasoning=False,
+        input=["text", "image"],
+        cost=ModelCost(input=2.5, output=10, cache_read=1.25),
+        context_window=128000,
+        max_tokens=16384,
+    ),
+    Model(
+        id="gpt-4o-mini",
+        name="GPT-4o mini",
+        api="openai-completions",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        reasoning=False,
+        input=["text", "image"],
+        cost=ModelCost(input=0.15, output=0.6, cache_read=0.075),
+        context_window=128000,
+        max_tokens=16384,
+    ),
+]
+
+
+__all__ = ["openai_api_provider", "OPENAI_MODELS"]
