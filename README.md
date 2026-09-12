@@ -8,13 +8,13 @@
 
 本仓库的实现有：
 - [X] pi统一打包本地源码安装，可以直接`from pi.py_ai import *`使用所需的包
-- [X] 增加`docs/`目录，python代码解读
 - [X] 增加一个可以多轮运行的示例, 包含模型注册、工具注册 `hello_agent_loop.py`
-- [] 更多真实的Tool的注册
+- [X] 更多真实的Tool的注册， 增加 get_city_weather、web_search 真实tool，详见`pi/pi_tools/`目录
 - [] Skill的加载
 - [] Extension加载
 - [] 运行时compact
-- [] session持久化，恢复
+- [] session持久化，对话恢复
+- [X] 增加`docs/`目录，python代码解读
 
 
 # 立刻运行agent_loop项目
@@ -31,6 +31,11 @@ cp .env.example .env
 python hello_agent_loop.py
 
 ```
+
+
+# 存在问题
+1. web_search() 无法理解‘今天’、‘最近’的具体时间含义，读者需自行去除时间指代的歧义
+2. get_city_weather(), 目前只支持获取指定城市的实时天气，明天、几天后的天气 需自行实现
 
 
 

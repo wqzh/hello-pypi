@@ -1,0 +1,4 @@
+aiohttp
+tavily-python
+python-dotenv
+

@@ -4,6 +4,7 @@ import asyncio
 from pi.pi_ai import Model, TextContent, UserMessage
 from pi.pi_agent_core import Agent, AgentOptions, AgentToolResult
 from load_env import load_env_config
+from pi.pi_tools import WeatherDemoTool, GetCityWeatherTool, WebSearchTavilyTool
 
 API_KEY, MODEL_CONFIG = load_env_config()
 
@@ -25,27 +26,6 @@ model = Model(
 print(f"[INFO] 模型配置: {model.id} @ {model.base_url}")
 
 
-## 注册可以使用的工具
-class WeatherTool:
-    name = "get_weather"
-    description = "查询天气"
-    label = "Weather"
-    parameters = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
-    async def execute(self, tool_call_id, params, cancel_event=None, on_update=None):
-        # 需替换成调用真实的 tool, 通过访问真实的api 获取天气
-        
-        city_weather_map = {
-            '北京': '晴转多云 25°C',
-            '天津': '小雨 20~23°C',
-        }
-        city = params['city']
-        if city in city_weather_map:
-            weather_result = city_weather_map[city]
-        else:
-            weather_result = f"{city} 天气，我猜可能是 小雪，-5°C"
-
-        print(f"\n[工具执行] weather_result")
-        return AgentToolResult(content=[TextContent(text=weather_result)])
 
 
 async def create_agent():
@@ -54,7 +34,8 @@ async def create_agent():
         initial_state={
             "system_prompt": "你是一个智能助手，你必须用用户提问对应的语种进行思考和回答！。你可以调用你掌握的工具来辅助自己。",
             "model": model,
-            "tools": [WeatherTool()],  # 告诉模型可以使用哪些工具
+            # "tools": [WeatherDemoTool()],  # 告诉模型可以使用哪些工具
+            "tools": [GetCityWeatherTool(), WebSearchTavilyTool()],
             "thinking_level": None  # "low",  # 开启思考过程，好像无效？
         },
         get_api_key=lambda p: API_KEY,
