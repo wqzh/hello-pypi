@@ -1,4 +1,6 @@
 # Ignore bins directory  .gitignore 
+trashbin/
+
 .git/
 
 

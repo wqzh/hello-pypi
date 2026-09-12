@@ -672,10 +672,10 @@ def _run_openai_stream(
 def _resolve_api_key() -> str:
     import os
 
-    key = os.environ.get("OPENAI_API_KEY", "")
+    key = os.environ.get("PI_OPENAI_API_KEY", "")
     if not key:
         raise RuntimeError(
-            "未找到 API key：请在 options.api_key 传入，或设置 OPENAI_API_KEY 环境变量"
+            "未找到 API key：请在 options.api_key 传入，或设置 PI_OPENAI_API_KEY 环境变量"
         )
     return key
 

@@ -1,6 +1,24 @@
 # Changelog
 
 
+
+## [2026-09-12 Night]
+
+feat(compaction): integrate context compaction and basic file-processing tools
+feat: 集成上下文压缩功能和基础文件读写查操作
+
+- hello_agent_loop.py:
+  - 新增上下文压缩逻辑（CompactionSettings），支持阈值触发、保留tokens、保留最近消息
+  - prompt运行后自动检测token消耗，超过阈值时触发摘要压缩
+  - 导入并注册 PI_BUILTIN_TOOLS（BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool）
+
+- pi/pi_agent_core/harness/compaction.py: 修复导入路径 (pi_ai → pi.pi_ai)
+- pi/pi_ai/providers/openai_provider.py: 环境变量 OPENAI_API_KEY 改为 PI_OPENAI_API_KEY
+- .env.example: 补充 PI_OPENAI_API_KEY 配置说明（用于压缩）
+- README.md: 修正错别字
+- BUG: TODO: prompt方法结束后才压缩。中途某一步可能就超出token限制了
+
+
 ## [2026-09-12 Noon]
 
 ### Added

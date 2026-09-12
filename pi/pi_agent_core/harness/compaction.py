@@ -185,7 +185,7 @@ async def generate_summary(
     # 序列化消息为文本
     serialized = _serialize_conversation(messages)
     ctx_msg = UserMessage(content=f"Summarize this conversation:\n\n{serialized}")
-    from pi_ai import Context, SimpleStreamOptions
+    from pi.pi_ai import Context, SimpleStreamOptions
 
     ctx = Context(system_prompt=SUMMARIZATION_SYSTEM_PROMPT, messages=[ctx_msg])
     isolated_options = {

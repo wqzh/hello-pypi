@@ -1,11 +1,31 @@
 import asyncio
+import time
 
 
 from pi.pi_ai import Model, TextContent, UserMessage
 from pi.pi_agent_core import Agent, AgentOptions, AgentToolResult
 from pi.pi_agent_core.harness.skills import LoadSkillsOptions, load_skills, format_skills_for_prompt
+from pi.pi_agent_core.harness.compaction import (
+    estimate_context_tokens,
+    should_compact,
+    find_cut_point,
+    generate_summary,
+    CompactionSettings,
+)
 from load_env import load_env_config
 from pi.pi_tools import WeatherDemoTool, GetCityWeatherTool, WebSearchTavilyTool
+
+from pi.pi_coding_agent.tools import (
+    BashTool,
+    EditTool,
+    FindTool,
+    GrepTool,
+    LsTool,
+    ReadTool,
+    WriteTool
+)
+PI_BUILTIN_TOOLS = [BashTool(), EditTool(), FindTool(), GrepTool(), LsTool(), ReadTool(), WriteTool()]
+
 
 API_KEY, MODEL_CONFIG = load_env_config()
 
@@ -37,6 +57,46 @@ skills_block = format_skills_for_prompt(skills.skills)
 print(f"[INFO] Loaded {len(skills.skills)} skill(s)")
 
 
+# 压缩配置 
+compaction_settings = CompactionSettings(
+    enabled=True,
+    ## 见：pi/pi_agent_core/harness/compaction.py， should_compact() 函数， 
+    ## context_tokens 超过 context_window 的 80% 时触发压缩。预计压缩成 reserve_tokens 
+    ## 因此： reserve_tokens < model.context_window. 
+    ## `model.context_windo` 是模型的最大上下文长度 在 .env  PI_LLM_CONTEXT_WINDOW 配置 
+    reserve_tokens=30000,  # 根据实际场景，自行修改。可放到.env中
+    keep_recent_tokens=8000,
+    
+    # reserve_tokens=1000,  # 根据实际场景，自行修改。可放到.env中
+    # keep_recent_tokens=800,
+)
+
+async def compact_messages(messages):
+    """用 pi 内置压缩：摘要旧消息，返回 (new_messages, before_tokens, after_tokens)"""
+    before_tokens = estimate_context_tokens(messages)
+    if before_tokens == 0:
+        return messages, before_tokens, before_tokens
+
+    cut_idx = find_cut_point(messages, compaction_settings.keep_recent_tokens)
+    if cut_idx <= 1:
+        return messages, before_tokens, before_tokens
+
+    to_summarize = messages[:cut_idx]
+    kept = messages[cut_idx:]
+
+    summary_text = await generate_summary(model, to_summarize, api_key=API_KEY)
+    summary_msg = UserMessage(
+        role="user",
+        content=[TextContent(text=f"[Previous conversation summary]\n\n{summary_text}")],
+        timestamp=int(time.time() * 1e9),
+    )
+
+    new_messages = [summary_msg] + kept
+    after_tokens = estimate_context_tokens(new_messages)
+    return new_messages, before_tokens, after_tokens
+
+
+# 创建单Agent实例
 async def create_agent():
     """创建单例 agent。该 agent 会在内部维护历史对话上下文 (state.messages)。"""
     base_prompt = "你是一个智能助手，你必须用用户提问对应的语种进行思考和回答！。你可以调用你掌握的工具来辅助自己。"
@@ -47,7 +107,9 @@ async def create_agent():
             "system_prompt": system_prompt,
             "model": model,
             # "tools": [WeatherDemoTool()],  # 告诉模型可以使用哪些工具
-            "tools": [GetCityWeatherTool(), WebSearchTavilyTool()],
+            # "tools": [GetCityWeatherTool(), WebSearchTavilyTool()],
+            # "tools": [GetCityWeatherTool(), WebSearchTavilyTool(), ReadTool(), BashTool()], # 读取本地文件
+            "tools": [GetCityWeatherTool(), WebSearchTavilyTool()] + PI_BUILTIN_TOOLS, # 操作本地文件
             "thinking_level": None  # "low",  # 开启思考过程，好像无效？
         },
         get_api_key=lambda p: API_KEY,
@@ -83,7 +145,7 @@ async def main():
                 elif aev.type == "thinking_delta":
                     print(aev.delta, end="", flush=True)
                 elif aev.type == "thinking_end":
-                    print(" [思考完毕]\n")
+                    print(" [思考完毕]\n", flush=True)
             elif ev.message and ev.message.role == "assistant" and ev.message.content:
                 for block in ev.message.content:
                     if block.type == "text" and block.text:
@@ -142,6 +204,23 @@ async def main():
             # agent.prompt() 会把用户消息追加到 state.messages，
             # 并在内部创建 context snapshot (含所有历史消息) 传给 agent_loop
             await agent.prompt(user_input)
+
+            ## 在.prompt()运行结束后，压缩检查 (⚠️：可能在思考过程中、tool调用的时候，就超出了限制)
+            msgs = agent.state.messages
+            tokens = estimate_context_tokens(msgs)
+            print(f"\n[DEBUG] 当前历史消息数: {len(msgs)}, 估算 tokens: {tokens}", flush=True)
+
+            if should_compact(tokens, model.context_window, compaction_settings):
+                threshold = model.context_window - compaction_settings.reserve_tokens
+                print(f"\n[COMPACT] 触发压缩 (tokens={tokens} > {threshold})", flush=True)
+                try:
+                    new_msgs, before_t, after_t = await compact_messages(msgs)
+                    agent.state.messages = new_msgs
+                    saved = before_t - after_t
+                    print(f"\n[COMPACT] 完成: {before_t} → {after_t} tokens (节省 {saved} tokens, {len(new_msgs)} messages)", flush=True)
+                except Exception as ce:
+                    print(f"\n[WARN] 压缩失败: {ce}", flush=True)
+
 
             # 调试：查看当前历史消息数量
             print(f"\n[DEBUG] 当前历史消息数: {len(agent.state.messages)}", flush=True)

@@ -1,7 +1,7 @@
 
 
 # 简介
-一个基于Python实现的pi-agent-core核心代码的二次开发项目。可自行注册业务所需的tool共agent调用.
+一个基于Python实现的pi-agent-core核心代码的二次开发项目。可自行注册业务所需的tool供agent调用.
 
 读者需自行评估python和typescript的运行性能差异。
 
@@ -9,10 +9,10 @@
 本仓库的实现有：
 - [X] pi统一打包本地源码安装，可以直接`from pi.py_ai import *`使用所需的包，详见`pi/`目录
 - [X] 增加一个可以多轮运行的示例, 包含模型注册、工具注册、skills加载 `hello_agent_loop.py`
-- [X] 更多真实的Tool的注册， 增加 get_city_weather、web_search 真实tool，详见`pi/pi_tools/`目录
+- [X] 更多真实的Tool的注册， 增加 get_city_weather、web_search 真实tool，以及read,write,bash等7个内置操作。详见`pi/pi_tools/`目录
 - [X] Skill的加载, 集成 Skill 加载系统和3个初始 skill, 详见`.pi/skills/`目录
 - [] Extension加载
-- [] 运行时compact
+- [X] 运行时compact
 - [] session持久化，对话恢复
 - [X] 增加`docs/`目录，python代码解读
 
@@ -33,10 +33,10 @@ python hello_agent_loop.py
 ```
 
 
-# 存在问题
+# 存在问题 TODO
 1. web_search() 无法理解‘今天’、‘最近’的具体时间含义，读者需自行去除时间指代的歧义
 2. get_city_weather(), 目前只支持获取指定城市的实时天气，明天、几天后的天气 需自行实现
-
+3. compaction: prompt方法结束后才压缩。中途某一步可能就超出token限制了. 是否要调整压缩的位置？？
 
 
 # 本地源码安装

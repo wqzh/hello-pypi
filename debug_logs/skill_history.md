@@ -1,5 +1,6 @@
 #  Try1: 2026.9.12  ===================
 
+```
 >python hello_agent_loop.py
 [INFO] 已加载 .env 文件: xxx/hello-pypi/.env
 [INFO] 模型配置: xxxx @ http://xxxx/v1
@@ -165,3 +166,4 @@
 [DEBUG] 当前历史消息数: 10
 
 你:
+```
