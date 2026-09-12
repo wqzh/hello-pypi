@@ -3,6 +3,7 @@ import asyncio
 
 from pi.pi_ai import Model, TextContent, UserMessage
 from pi.pi_agent_core import Agent, AgentOptions, AgentToolResult
+from pi.pi_agent_core.harness.skills import LoadSkillsOptions, load_skills, format_skills_for_prompt
 from load_env import load_env_config
 from pi.pi_tools import WeatherDemoTool, GetCityWeatherTool, WebSearchTavilyTool
 
@@ -28,11 +29,22 @@ print(f"[INFO] 模型配置: {model.id} @ {model.base_url}")
 
 
 
+# 加载 skills（项目级 .pi/skills/ + 用户级 ~/.pi/agent/skills/）
+skills = load_skills(LoadSkillsOptions())
+if skills.diagnostics:
+    print(f"[WARN] Skill diagnostics: {skills.diagnostics}")
+skills_block = format_skills_for_prompt(skills.skills)
+print(f"[INFO] Loaded {len(skills.skills)} skill(s)")
+
+
 async def create_agent():
     """创建单例 agent。该 agent 会在内部维护历史对话上下文 (state.messages)。"""
+    base_prompt = "你是一个智能助手，你必须用用户提问对应的语种进行思考和回答！。你可以调用你掌握的工具来辅助自己。"
+    system_prompt = base_prompt + "\n\n" + skills_block if skills_block else base_prompt
+    
     return Agent(AgentOptions(
         initial_state={
-            "system_prompt": "你是一个智能助手，你必须用用户提问对应的语种进行思考和回答！。你可以调用你掌握的工具来辅助自己。",
+            "system_prompt": system_prompt,
             "model": model,
             # "tools": [WeatherDemoTool()],  # 告诉模型可以使用哪些工具
             "tools": [GetCityWeatherTool(), WebSearchTavilyTool()],

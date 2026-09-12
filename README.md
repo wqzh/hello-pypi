@@ -7,10 +7,10 @@
 
 
 本仓库的实现有：
-- [X] pi统一打包本地源码安装，可以直接`from pi.py_ai import *`使用所需的包
-- [X] 增加一个可以多轮运行的示例, 包含模型注册、工具注册 `hello_agent_loop.py`
+- [X] pi统一打包本地源码安装，可以直接`from pi.py_ai import *`使用所需的包，详见`pi/`目录
+- [X] 增加一个可以多轮运行的示例, 包含模型注册、工具注册、skills加载 `hello_agent_loop.py`
 - [X] 更多真实的Tool的注册， 增加 get_city_weather、web_search 真实tool，详见`pi/pi_tools/`目录
-- [] Skill的加载
+- [X] Skill的加载, 集成 Skill 加载系统和3个初始 skill, 详见`.pi/skills/`目录
 - [] Extension加载
 - [] 运行时compact
 - [] session持久化，对话恢复
