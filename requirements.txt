@@ -1,4 +1,6 @@
 aiohttp
 tavily-python
 python-dotenv
-
+fastapi
+uvicorn
+flask[async]

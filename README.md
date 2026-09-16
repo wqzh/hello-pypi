@@ -6,15 +6,18 @@
 读者需自行评估python和typescript的运行性能差异。
 
 
+<img src="imgs/pypi-main-ui.png" alt="pypi-main-ui" width="300" style="display: block; margin: 0 auto;">
+
+
 本仓库的实现有：
-- [X] pi统一打包本地源码安装，可以直接`from pi.py_ai import *`使用所需的包，详见`pi/`目录
-- [X] 增加一个可以多轮运行的示例, 包含模型注册、工具注册、skills加载 `hello_agent_loop.py`
-- [X] 更多真实的Tool的注册， 增加 get_city_weather、web_search 真实tool，以及read,write,bash等7个内置操作。详见`pi/pi_tools/`目录
-- [X] Skill的加载, 集成 Skill 加载系统和3个初始 skill, 详见`.pi/skills/`目录
-- [] Extension加载
-- [X] 运行时compact
-- [] session持久化，对话恢复
-- [X] 增加`docs/`目录，python代码解读
+- [x] pi统一打包本地源码安装，可以直接`from pi.py_ai import *`使用所需的包，详见`pi/`目录
+- [x] 增加一个可以多轮运行的示例, 包含模型注册、工具注册、skills加载 `hello_agent_loop.py`
+- [x] 更多真实的Tool的注册， 增加 get_city_weather、web_search 真实tool，以及read,write,bash等7个内置操作。详见`pi/pi_tools/`目录
+- [x] Skill的加载, 集成 Skill 加载系统和3个初始 skill, 详见`.pi/skills/`目录
+- [ ] Extension加载
+- [x] 运行时compact
+- [ ] session持久化，对话恢复
+- [x] 增加`docs/`目录，python代码解读
 
 
 # 立刻运行agent_loop项目
