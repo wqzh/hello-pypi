@@ -6,7 +6,7 @@
 读者需自行评估python和typescript的运行性能差异。
 
 
-<img src="imgs/pypi-main-ui.png" alt="pypi-main-ui" width="300" style="display: block; margin: 0 auto;">
+<img src="imgs/pypi-main-ui.png" alt="pypi-main-ui" style="display: block; margin: 0 auto;">
 
 
 本仓库的实现有：

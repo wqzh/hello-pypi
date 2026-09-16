@@ -1,15 +1,18 @@
 import asyncio
 import json
+import os
 import time
 import uuid
+from pathlib import Path
 from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from pi.pi_ai import Model, TextContent, UserMessage
+from pi.pi_ai import Model, TextContent, UserMessage, AssistantMessage, ToolResultMessage
 from pi.pi_agent_core import Agent, AgentOptions
+from pi.pi_agent_core.harness.session import Session, JsonlSessionStorage, SessionEntryType
 from pi.pi_agent_core.harness.skills import LoadSkillsOptions, load_skills, format_skills_for_prompt
 from pi.pi_agent_core.harness.compaction import (
     estimate_context_tokens,
@@ -58,7 +61,7 @@ SYSTEM_PROMPT = BASE_PROMPT + "\n\n" + skills_block if skills_block else BASE_PR
 
 
 # ==================== 会话管理 ====================
-class Session:
+class WebSession:
     def __init__(self, session_id: str, title: str = "新对话"):
         self.id = session_id
         self.title = title
@@ -68,14 +71,106 @@ class Session:
         self.display_messages: list[dict] = []
         self.agent: Optional[Agent] = None
         self.busy = False   # 是否正在处理中
+        self.pi_session: Optional[Session] = None  # pi 会话对象
+        self.storage_path = Path(".pi/sessions") / f"{session_id}.jsonl"
 
     async def ensure_agent(self):
         if self.agent is None:
             self.agent = await create_agent()
+            # 加载历史会话
+            await self.load_session()
         return self.agent
 
+    async def load_session(self):
+        """加载历史会话数据"""
+        if self.storage_path.exists():
+            storage = JsonlSessionStorage(self.storage_path)
+            self.pi_session = Session(storage)
+            # 构建显示消息
+            self.display_messages = []
+            for entry in self.pi_session.get_entries():
+                if entry.type == "message":
+                    msg = entry.data
+                    if isinstance(msg, (UserMessage, AssistantMessage, ToolResultMessage)):
+                        role = msg.role
+                        content = ""
+                        if hasattr(msg, 'content') and msg.content:
+                            if isinstance(msg.content, list):
+                                for item in msg.content:
+                                    if hasattr(item, 'text'):
+                                        content += item.text
+                            else:
+                                content = str(msg.content)
+                        self.display_messages.append({
+                            "role": role,
+                            "content": content,
+                            "ts": time.time()
+                        })
+                elif entry.type == "thinking_level_change":
+                    # 可以在这里处理思考级别变化
+                    pass
+                elif entry.type == "compaction":
+                    # 可以在这里处理压缩点
+                    pass
+        else:
+            # 创建新的会话存储
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            storage = JsonlSessionStorage(self.storage_path)
+            self.pi_session = Session(storage)
 
-SESSIONS: Dict[str, Session] = {}
+    async def save_message(self, role: str, content: str):
+        """保存消息到会话存储"""
+        if self.pi_session:
+            if role == "user":
+                msg = UserMessage(content=[TextContent(text=content)])
+            elif role == "assistant":
+                msg = AssistantMessage(content=[TextContent(text=content)])
+            else:
+                msg = ToolResultMessage(content=[TextContent(text=content)])
+            self.pi_session.append_message(msg)
+
+    async def save_thinking(self, thinking: str):
+        """保存思考过程"""
+        if self.pi_session:
+            # 这里简化处理，将思考作为助手消息保存
+            self.pi_session.append_message(AssistantMessage(content=[TextContent(text=f"[思考] {thinking}")]))
+
+    async def save_tool_call(self, tool_name: str, args: dict, result: str):
+        """保存工具调用结果"""
+        if self.pi_session:
+            self.pi_session.append_message(ToolResultMessage(
+                content=[TextContent(text=result)],
+                tool_name=tool_name,
+                tool_call_id="tool-call-1"
+            ))
+
+    async def compact_session(self, summary: str, retained_tail: list):
+        """保存压缩点"""
+        if self.pi_session:
+            self.pi_session.append_compaction(summary, retained_tail)
+
+
+# ==================== FastAPI ====================
+app = FastAPI()
+
+# 启动时加载所有会话
+@app.on_event("startup")
+async def startup_event():
+    await load_all_sessions()
+
+
+SESSIONS: Dict[str, WebSession] = {}
+
+async def load_all_sessions():
+    """加载所有历史会话"""
+    sessions_dir = Path(".pi/sessions")
+    if sessions_dir.exists():
+        for file_path in sessions_dir.glob("*.jsonl"):
+            session_id = file_path.stem
+            if session_id not in SESSIONS:
+                s = WebSession(session_id, f"历史会话 {session_id[:8]}...")
+                await s.load_session()
+                SESSIONS[session_id] = s
 
 
 async def create_agent():
@@ -113,6 +208,11 @@ async def compact_messages(messages):
 # ==================== FastAPI ====================
 app = FastAPI()
 
+# 启动时加载所有会话
+@app.on_event("startup")
+async def startup_event():
+    await load_all_sessions()
+
 
 class CreateSessionReq(BaseModel):
     title: Optional[str] = "新对话"
@@ -141,13 +241,17 @@ async def list_sessions():
 @app.post("/api/sessions")
 async def create_session(req: CreateSessionReq):
     sid = uuid.uuid4().hex
-    s = Session(sid, req.title or "新对话")
+    s = WebSession(sid, req.title or "新对话")
     SESSIONS[sid] = s
     return JSONResponse({"id": sid, "title": s.title})
 
 
 @app.delete("/api/sessions/{sid}")
 async def delete_session(sid: str):
+    # 删除会话文件
+    session = SESSIONS.get(sid)
+    if session and session.storage_path.exists():
+        session.storage_path.unlink()
     SESSIONS.pop(sid, None)
     return JSONResponse({"ok": True})
 
@@ -180,6 +284,36 @@ async def ws_endpoint(ws: WebSocket, sid: str):
         if payload is not None:
             try:
                 out_queue.put_nowait(payload)
+                # 同时保存事件到会话存储
+                session = SESSIONS.get(sid)
+                if session and session.pi_session:
+                    if payload.get("type") == "thinking_start":
+                        session.pi_session.append_thinking_level_change("thinking")
+                    elif payload.get("type") == "thinking_delta":
+                        # 可以在这里保存思考过程中的内容
+                        pass
+                    elif payload.get("type") == "thinking_end":
+                        session.pi_session.append_thinking_level_change(None)
+                    elif payload.get("type") == "tool_start":
+                        session.pi_session.append_message(ToolResultMessage(
+                            content=[TextContent(text=f"[工具调用开始] {payload.get('tool_name', '')}")],
+                            tool_name=payload.get('tool_name', ''),
+                            tool_call_id="tool-call-1"
+                        ))
+                    elif payload.get("type") == "tool_end":
+                        session.pi_session.append_message(ToolResultMessage(
+                            content=[TextContent(text=f"[工具调用结束] {payload.get('result', '')}")],
+                            tool_name=payload.get('tool_name', ''),
+                            tool_call_id="tool-call-1"
+                        ))
+                    elif payload.get("type") == "message_end":
+                        # 保存助手消息
+                        session.pi_session.append_message(AssistantMessage(
+                            content=[TextContent(text=payload.get('content', ''))]
+                        ))
+                    elif payload.get("type") == "text_delta":
+                        # 可以在这里保存文本增量
+                        pass
             except Exception:
                 pass
 
@@ -216,8 +350,36 @@ async def ws_endpoint(ws: WebSocket, sid: str):
                 "title": session.title,
             }, ensure_ascii=False))
 
+            # 保存用户消息到会话存储
+            await session.save_message("user", text)
+
+            # 重置显示消息列表，从会话存储重新加载
+            session.display_messages = []
+            if session.pi_session:
+                for entry in session.pi_session.get_entries():
+                    if entry.type == "message":
+                        msg = entry.data
+                        if isinstance(msg, (UserMessage, AssistantMessage, ToolResultMessage)):
+                            role = msg.role
+                            content = ""
+                            if hasattr(msg, 'content') and msg.content:
+                                if isinstance(msg.content, list):
+                                    for item in msg.content:
+                                        if hasattr(item, 'text'):
+                                            content += item.text
+                                else:
+                                    content = str(msg.content)
+                            session.display_messages.append({
+                                "role": role,
+                                "content": content,
+                                "ts": time.time()
+                            })
+
             session.busy = True
             try:
+                # 保存用户消息
+                await session.save_message("user", text)
+                
                 await agent.prompt(text)
             except Exception as e:
                 await ws.send_text(json.dumps({
@@ -238,6 +400,11 @@ async def ws_endpoint(ws: WebSocket, sid: str):
                             "before": before_t,
                             "after": after_t,
                         }, ensure_ascii=False))
+                        # 保存压缩点
+                        await session.compact_session(
+                            f"上下文压缩，保留最后 {len(new_msgs)} 条消息",
+                            new_msgs
+                        )
                 except Exception as ce:
                     await ws.send_text(json.dumps({
                         "type": "warn", "message": f"压缩失败: {ce}"
@@ -294,6 +461,15 @@ def serialize_event(ev) -> Optional[dict]:
             "tool_name": getattr(ev, "tool_name", ""),
             "result": result_text,
         }
+
+    if t == "thinking_start":
+        return {"type": "thinking_start"}
+
+    if t == "thinking_delta":
+        return {"type": "thinking_delta", "delta": getattr(ev, "delta", "")}
+
+    if t == "thinking_end":
+        return {"type": "thinking_end"}
 
     return None
 

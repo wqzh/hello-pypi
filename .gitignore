@@ -1,6 +1,9 @@
 # Ignore bins directory  .gitignore 
 trashbin/
 
+# ignore sessions 
+.pi/sessions/
+
 .git/
 
 
