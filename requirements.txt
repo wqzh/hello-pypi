@@ -3,4 +3,7 @@ tavily-python
 python-dotenv
 fastapi
 uvicorn
+uvicorn[standard]
 flask[async]
+websockets
+wsproto
