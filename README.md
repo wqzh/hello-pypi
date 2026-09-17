@@ -1,5 +1,10 @@
 
 
+<p align="center">
+  <a href="./README.md">中文</a> | <a href="./README_EN.md">EN</a>
+</p>
+
+
 # 简介
 一个基于Python实现的pi-agent-core核心代码的二次开发项目。可自行注册业务所需的tool供agent调用.
 
@@ -11,12 +16,13 @@
 
 本仓库的实现有：
 - [x] pi统一打包本地源码安装，可以直接`from pi.py_ai import *`使用所需的包，详见`pi/`目录
-- [x] 增加一个可以多轮运行的示例, 包含模型注册、工具注册、skills加载 `hello_agent_loop.py`
+- [x] 增加一个可以多轮运行的示例, 包含模型注册、工具注册、skills加载，CMD黑框交互 `hello_agent_loop.py`
+- [x] 增加一个可以多轮运行的web示例, 包含模型注册、工具注册、skills加载、session加载等，web交互 `hello_agent_loop_web.py`
 - [x] 更多真实的Tool的注册， 增加 get_city_weather、web_search 真实tool，以及read,write,bash等7个内置操作。详见`pi/pi_tools/`目录
 - [x] Skill的加载, 集成 Skill 加载系统和3个初始 skill, 详见`.pi/skills/`目录
 - [ ] Extension加载
 - [x] 运行时compact
-- [ ] session持久化，对话恢复
+- [x] session持久化，对话恢复. 会话历史将保存在 本项目的`.pi/sessions/`下，详见`hello_agent_loop_web.py`
 - [x] 增加`docs/`目录，python代码解读
 
 
@@ -30,9 +36,12 @@ pip install -e pi
 cp .env.example .env
 # 必须修改.env中3个变量： PI_LLM_BASE_URL、PI_LLM_MODEL_ID 、PI_LLM_API_KEY
 
-# 单agent,多轮对话
-python hello_agent_loop.py
+# 必要时 pip install -r requirements.txt
 
+# 单agent,多轮对话
+python hello_agent_loop.py    # cmd interaction
+
+python hello_agent_loop_web.py  # local web interaction
 ```
 
 
