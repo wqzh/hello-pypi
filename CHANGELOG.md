@@ -1,5 +1,25 @@
 # Changelog
 
+## [2026-09-17 Noon]
+feat(main-ui): overhaul web session handling and chat UI
+
+feat: 全面重构 Web 会话处理与聊天界面
+
+- hello_agent_loop_web.py:
+  - 新增通用提取工具 _get / _extract_blocks / _extract_tool_calls / _extract_tool_results，兼容属性访问与 dict 访问及多种 content 形态
+  - 重写 load_session：健壮版历史加载，支持 tool_call/tool_result 块解析与匹配
+  - WebSession 内聚 on_event 回调，移除 ws_endpoint 中闭包事件处理
+  - 新增工具调用消息展示（tool_start/tool_end）
+  - sessions 列表新增 preview（首条用户消息摘要）字段
+  - 修复 thinking_end 后文本被吞的 bug（bufferedText 机制）
+
+- index.html:
+  - 会话列表显示消息预览 + 创建时间
+  - 新增工具消息渲染（appendTool），历史工具块正常回显
+  - thinking/thinking_end 逻辑修复，thinking 结束后文本正确追加到 assistant 消息
+  - CSS 精简，清理冗余注释
+
+- imgs/pypi-main-ui.png: 更新 UI 截图
 
 
 ## [2026-09-12 Night]

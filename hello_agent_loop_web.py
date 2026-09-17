@@ -60,6 +60,142 @@ BASE_PROMPT = "你是一个智能助手，你必须用用户提问对应的语�
 SYSTEM_PROMPT = BASE_PROMPT + "\n\n" + skills_block if skills_block else BASE_PROMPT
 
 
+# ==================== 通用取值工具 ====================
+def _get(obj, *names, default=None):
+    """同时支持属性访问与 dict 访问，兼容反序列化后的不同形态。"""
+    if obj is None:
+        return default
+    for n in names:
+        if isinstance(obj, dict):
+            if n in obj and obj[n] is not None:
+                return obj[n]
+        else:
+            if hasattr(obj, n):
+                v = getattr(obj, n)
+                if v is not None:
+                    return v
+    return default
+
+
+def _extract_blocks(content) -> tuple[str, str]:
+    """从 message.content 提取 (thinking_text, answer_text)。
+
+    兼容 list[TextContent] / list[dict] / str / None。
+    reasoning 块的判定：
+      - textSignature / text_signature / signature == "reasoning_content"
+      - type in ("reasoning", "reasoning_content", "thinking")
+      - 有独立 .thinking 字段
+    非文本块（tool_call / tool_result 等）会被忽略，由调用方单独处理。
+    """
+    thinking = ""
+    answer = ""
+    if content is None:
+        return thinking, answer
+
+    if isinstance(content, str):
+        return thinking, content
+
+    if isinstance(content, list):
+        for item in content:
+            item_type = _get(item, "type", default="")
+            # 跳过非文本块
+            if item_type in ("tool_call", "tool_use", "tool_result", "image", "file"):
+                continue
+
+            sig = _get(item, "textSignature", "text_signature", "signature")
+            is_reasoning = (
+                sig == "reasoning_content"
+                or item_type in ("reasoning", "reasoning_content", "thinking")
+            )
+
+            text = _get(item, "text", default="")
+            if not text and isinstance(item, str):
+                text = item
+            if not isinstance(text, str):
+                text = str(text)
+
+            thinking_field = _get(item, "thinking", default="")
+
+            if is_reasoning or thinking_field:
+                thinking += text or ""
+                if thinking_field:
+                    thinking += thinking_field if isinstance(thinking_field, str) else str(thinking_field)
+            else:
+                answer += text
+        return thinking, answer
+
+    return thinking, str(content)
+
+
+def _extract_tool_calls(content) -> list[dict]:
+    """从 assistant 消息 content 中提取工具调用块。
+
+    返回 [{"tool_call_id":..., "tool_name":..., "args": {...}}, ...]
+    """
+    calls: list[dict] = []
+    if not isinstance(content, list):
+        return calls
+    for item in content:
+        item_type = _get(item, "type", default="")
+        if item_type not in ("tool_call", "tool_use", "function_call"):
+            continue
+        # tool_call 常见字段：name / tool_name / function.name
+        fn = _get(item, "function")
+        tool_name = (
+            _get(item, "tool_name", "name")
+            or _get(fn, "name")
+            or ""
+        )
+        args = _get(item, "args", "arguments", "input")
+        if args is None and fn is not None:
+            args = _get(fn, "arguments", "args")
+        call_id = _get(item, "tool_call_id", "id", "call_id", default="")
+        calls.append({
+            "tool_call_id": call_id,
+            "tool_name": tool_name,
+            "args": args if args is not None else {},
+        })
+    return calls
+
+
+def _extract_tool_results(content) -> list[dict]:
+    """从 tool / user 消息 content 中提取工具结果块。
+
+    返回 [{"tool_call_id":..., "tool_name":..., "result": str}, ...]
+    """
+    results: list[dict] = []
+    if not isinstance(content, list):
+        return results
+    for item in content:
+        item_type = _get(item, "type", default="")
+        if item_type not in ("tool_result", "tool_result_block", "function_result"):
+            continue
+        call_id = _get(item, "tool_call_id", "id", "call_id", default="")
+        tool_name = _get(item, "tool_name", "name", default="")
+
+        # result 内容可能是 str，也可能是 list[TextContent]，还可能是 dict
+        inner = _get(item, "content", "result", "output", default="")
+        result_text = ""
+        if isinstance(inner, str):
+            result_text = inner
+        elif isinstance(inner, list):
+            for sub in inner:
+                t = _get(sub, "text", default="")
+                if t:
+                    result_text += t if isinstance(t, str) else str(t)
+                elif isinstance(sub, str):
+                    result_text += sub
+        elif inner is not None:
+            result_text = str(inner)
+
+        results.append({
+            "tool_call_id": call_id,
+            "tool_name": tool_name,
+            "result": result_text,
+        })
+    return results
+
+
 # ==================== 会话管理 ====================
 class WebSession:
     def __init__(self, session_id: str, title: str = "新对话"):
@@ -67,68 +203,226 @@ class WebSession:
         self.title = title
         self.created_at = time.time()
         self.updated_at = time.time()
-        # 前端展示用的消息历史（user / assistant / tool）
         self.display_messages: list[dict] = []
+        self.first_user_ts: float = 0
         self.agent: Optional[Agent] = None
-        self.busy = False   # 是否正在处理中
-        self.pi_session: Optional[Session] = None  # pi 会话对象
+        self.busy = False
+        self.pi_session: Optional[Session] = None
         self.storage_path = Path(".pi/sessions") / f"{session_id}.jsonl"
-        # 流式收集当前回复内容
         self._pending_thinking = ""
         self._pending_text = ""
         self._thinking_active = False
+        self._subscribed = False
+        self._out_queue: Optional[asyncio.Queue] = None
 
     async def ensure_agent(self):
         if self.agent is None:
             self.agent = await create_agent()
-            # 加载历史会话
             await self.load_session()
+            self.agent.state.messages = self.build_agent_messages()
+        if not self._subscribed:
+            self._subscribed = True
+            self.agent.subscribe(self.on_event)
         return self.agent
 
+    def on_event(self, ev, sig):
+        payload = serialize_event(ev)
+        if payload is None:
+            return
+
+        if self._out_queue is not None:
+            try:
+                self._out_queue.put_nowait(payload)
+            except Exception:
+                pass
+
+        ptype = payload.get("type")
+        sess = self
+        if not sess or not sess.pi_session:
+            return
+
+        if ptype == "thinking_start":
+            sess._thinking_active = True
+            sess._pending_thinking = ""
+        elif ptype == "thinking_delta":
+            if sess._thinking_active:
+                sess._pending_thinking += payload.get("delta", "")
+        elif ptype == "thinking_end":
+            sess._thinking_active = False
+
+        if ptype == "text_delta":
+            sess._pending_text += payload.get("delta", "")
+
+        if ptype == "tool_start":
+            sess.display_messages.append({
+                "role": "tool",
+                "tool_name": payload.get("tool_name", ""),
+                "args": payload.get("args", {}),
+                "result": "",
+                "ts": time.time()
+            })
+        if ptype == "tool_end":
+            tool_name = payload.get("tool_name", "")
+            result = payload.get("result", "")
+            for m in reversed(sess.display_messages):
+                if m.get("role") == "tool" and m.get("tool_name") == tool_name and m.get("result") == "":
+                    m["result"] = result
+                    break
+
+        if ptype == "message_end":
+            role = payload.get("role", "")
+            if role == "assistant" and (sess._pending_text or sess._pending_thinking):
+                thinking = sess._pending_thinking
+                text = sess._pending_text
+                asyncio.create_task(sess.save_assistant_message(text, thinking))
+                sess.display_messages.append({
+                    "role": "assistant",
+                    "content": text,
+                    "thinking": thinking,
+                    "ts": time.time()
+                })
+                sess._pending_thinking = ""
+                sess._pending_text = ""
+
+    def build_agent_messages(self):
+        msgs = []
+        for m in self.display_messages:
+            if m["role"] == "user":
+                msgs.append(UserMessage(content=[TextContent(text=m["content"])], timestamp=int(time.time() * 1e9)))
+            elif m["role"] == "assistant":
+                blocks = [TextContent(text=m["content"])] if m.get("content") else []
+                msgs.append(AssistantMessage(content=blocks))
+        return msgs
+
     async def load_session(self):
-        """加载历史会话数据"""
-        if self.storage_path.exists():
-            storage = JsonlSessionStorage(self.storage_path)
-            self.pi_session = Session(storage)
-            # 构建显示消息（去重）
-            self.display_messages = []
-            seen_messages: list[tuple[str, str]] = []  # (role, content) for dedup
-            for entry in self.pi_session.get_entries():
-                if entry.type == "message":
-                    msg = entry.data
-                    if isinstance(msg, (UserMessage, AssistantMessage, ToolResultMessage)):
-                        role = msg.role
-                        content = ""
-                        thinking = ""
-                        if hasattr(msg, 'content') and msg.content:
-                            if isinstance(msg.content, list):
-                                for item in msg.content:
-                                    if hasattr(item, 'text'):
-                                        content += item.text
-                                    if hasattr(item, 'thinking'):
-                                        thinking += item.thinking
-                            else:
-                                content = str(msg.content)
-                        # 去重
-                        key = (role, content)
-                        if key not in seen_messages:
-                            seen_messages.append(key)
-                            self.display_messages.append({
-                                "role": role,
-                                "content": content,
-                                "thinking": thinking,
-                                "ts": time.time()
-                            })
-                elif entry.type == "compaction":
-                    pass
-        else:
-            # 创建新的会话存储
+        """加载历史会话数据（健壮版，兼容属性/dict 及 tool_call/tool_result 块）"""
+        if not self.storage_path.exists():
             self.storage_path.parent.mkdir(parents=True, exist_ok=True)
             storage = JsonlSessionStorage(self.storage_path)
             self.pi_session = Session(storage)
+            return
+
+        storage = JsonlSessionStorage(self.storage_path)
+        self.pi_session = Session(storage)
+        self.display_messages = []
+        first_user_text = None
+        seen_entry_ids = set()
+
+        # 挂起的工具调用：key = tool_call_id（若无则用 tool_name），value = display_messages 中的下标
+        pending_tools: Dict[str, int] = {}
+
+        try:
+            entries = list(self.pi_session.get_entries())
+        except Exception as e:
+            print(f"[WARN] load_session get_entries failed: {e}")
+            entries = []
+
+        for entry in entries:
+            etype = _get(entry, "type")
+            if etype != "message":
+                continue
+
+            eid = _get(entry, "id")
+            if eid is not None:
+                if eid in seen_entry_ids:
+                    continue
+                seen_entry_ids.add(eid)
+
+            msg = _get(entry, "data")
+            if msg is None:
+                continue
+
+            role = _get(msg, "role", default="")
+            content = _get(msg, "content")
+
+            # ---------- 1) 先看是否携带 tool_result 块（不管 role 是 tool 还是 user） ----------
+            tool_results = _extract_tool_results(content)
+            if tool_results:
+                for tr in tool_results:
+                    key = tr.get("tool_call_id") or tr.get("tool_name") or ""
+                    idx = pending_tools.get(key)
+                    if idx is None:
+                        # 没有匹配到挂起调用，兜底：新建一条 tool 记录
+                        self.display_messages.append({
+                            "role": "tool",
+                            "tool_name": tr.get("tool_name", "") or "",
+                            "args": {},
+                            "result": tr.get("result", ""),
+                            "ts": time.time()
+                        })
+                    else:
+                        self.display_messages[idx]["result"] = tr.get("result", "")
+                        pending_tools.pop(key, None)
+                # 该消息只承载工具结果，不作为普通消息渲染
+                continue
+
+            # ---------- 2) role == tool：纯工具结果消息（老格式） ----------
+            if role == "tool":
+                tool_name = _get(msg, "tool_name", "toolName", "name", default="") or ""
+                call_id = _get(msg, "tool_call_id", "id", default="")
+                _, result_text = _extract_blocks(content)
+                key = call_id or tool_name
+                idx = pending_tools.get(key)
+                if idx is not None:
+                    self.display_messages[idx]["result"] = result_text
+                    pending_tools.pop(key, None)
+                else:
+                    self.display_messages.append({
+                        "role": "tool",
+                        "tool_name": tool_name,
+                        "args": {},
+                        "result": result_text,
+                        "ts": time.time()
+                    })
+                continue
+
+            # ---------- 3) assistant：提取 reasoning/text + tool_call ----------
+            if role == "assistant":
+                thinking, answer = _extract_blocks(content)
+
+                # 若 assistant 只包含 tool_call 而没有正文，也要保留 tool 调用记录
+                # 正文（含 thinking）若非空，加入一条 assistant 展示
+                if answer or thinking:
+                    self.display_messages.append({
+                        "role": "assistant",
+                        "content": answer,
+                        "thinking": thinking,
+                        "ts": time.time()
+                    })
+
+                # 提取 tool_call 块，挂起等待结果
+                calls = _extract_tool_calls(content)
+                for c in calls:
+                    self.display_messages.append({
+                        "role": "tool",
+                        "tool_name": c["tool_name"],
+                        "args": c["args"],
+                        "result": "",
+                        "ts": time.time()
+                    })
+                    key = c.get("tool_call_id") or c.get("tool_name") or ""
+                    pending_tools[key] = len(self.display_messages) - 1
+                continue
+
+            # ---------- 4) user：真正的用户输入 ----------
+            if role == "user":
+                thinking, answer = _extract_blocks(content)
+                # user 消息一般没有 thinking，但兼容处理
+                self.display_messages.append({
+                    "role": "user",
+                    "content": answer or (thinking and ""),
+                    "thinking": "",
+                    "ts": time.time()
+                })
+                if first_user_text is None:
+                    first_user_text = answer
+                    self.first_user_ts = time.time()
+                continue
+
+        if first_user_text and self.title.startswith("历史会话"):
+            self.title = first_user_text[:30]
 
     async def save_assistant_message(self, text: str, thinking: str = ""):
-        """保存助手消息（含思考），格式参考标准 session"""
         if self.pi_session:
             blocks = []
             if thinking:
@@ -141,7 +435,6 @@ class WebSession:
 # ==================== FastAPI ====================
 app = FastAPI()
 
-# 启动时加载所有会话
 @app.on_event("startup")
 async def startup_event():
     await load_all_sessions()
@@ -150,13 +443,12 @@ async def startup_event():
 SESSIONS: Dict[str, WebSession] = {}
 
 async def load_all_sessions():
-    """加载所有历史会话"""
     sessions_dir = Path(".pi/sessions")
     if sessions_dir.exists():
         for file_path in sessions_dir.glob("*.jsonl"):
             session_id = file_path.stem
             if session_id not in SESSIONS:
-                s = WebSession(session_id, f"历史会话 {session_id[:8]}...")
+                s = WebSession(session_id, "历史会话")
                 await s.load_session()
                 SESSIONS[session_id] = s
 
@@ -202,6 +494,14 @@ async def index():
     return HTMLResponse(open("index.html", "r", encoding="utf-8").read())
 
 
+def get_first_user_preview(messages: list[dict]) -> str:
+    for m in messages:
+        if m["role"] == "user":
+            text = m.get("content", "")
+            return text[:25] + "..." if len(text) > 25 else text
+    return "新对话"
+
+
 @app.get("/api/sessions")
 async def list_sessions():
     items = sorted(SESSIONS.values(), key=lambda s: s.updated_at, reverse=True)
@@ -209,7 +509,8 @@ async def list_sessions():
         {
             "id": s.id,
             "title": s.title,
-            "created_at": s.created_at,
+            "preview": get_first_user_preview(s.display_messages),
+            "created_at": s.first_user_ts or s.created_at,
             "updated_at": s.updated_at,
             "message_count": len(s.display_messages),
         }
@@ -227,7 +528,6 @@ async def create_session(req: CreateSessionReq):
 
 @app.delete("/api/sessions/{sid}")
 async def delete_session(sid: str):
-    # 删除会话文件
     session = SESSIONS.get(sid)
     if session and session.storage_path.exists():
         session.storage_path.unlink()
@@ -254,62 +554,8 @@ async def ws_endpoint(ws: WebSocket, sid: str):
 
     agent = await session.ensure_agent()
 
-    # 用队列把事件从 agent 回调异步推给前端
     out_queue: asyncio.Queue = asyncio.Queue()
-
-    def on_event(ev, sig):
-        etype = getattr(ev, 'type', None)
-        # print(f"[EVENT] type={etype}")
-        payload = serialize_event(ev)
-        if payload is None:
-            return
-        # print(f"[PAYLOAD] {payload.get('type')}")
-        try:
-            out_queue.put_nowait(payload)
-
-            ptype = payload.get("type")
-            sess = SESSIONS.get(sid)
-            if not sess or not sess.pi_session:
-                return
-
-            # 收集 thinking 内容
-            if ptype == "thinking_start":
-                sess._thinking_active = True
-                sess._pending_thinking = ""
-            elif ptype == "thinking_delta":
-                if sess._thinking_active:
-                    sess._pending_thinking += payload.get("delta", "")
-            elif ptype == "thinking_end":
-                sess._thinking_active = False
-
-            # 收集 text 内容
-            if ptype == "text_delta":
-                sess._pending_text += payload.get("delta", "")
-
-            # message_end: 只保存 assistant 消息一次
-            if ptype == "message_end":
-                role = payload.get("role", "")
-                if role == "assistant" and sess._pending_text:
-                    thinking = sess._pending_thinking
-                    text = sess._pending_text
-                    # 保存到 JSONL
-                    asyncio.create_task(sess.save_assistant_message(text, thinking))
-                    # 更新 display_messages
-                    sess.display_messages.append({
-                        "role": "assistant",
-                        "content": text,
-                        "thinking": thinking,
-                        "ts": time.time()
-                    })
-                    # 重置
-                    sess._pending_thinking = ""
-                    sess._pending_text = ""
-        except Exception as e:
-            print(f"[ERROR on_event] {e}")
-            import traceback
-            traceback.print_exc()
-
-    agent.subscribe(on_event)
+    session._out_queue = out_queue
 
     async def sender():
         while True:
@@ -331,13 +577,13 @@ async def ws_endpoint(ws: WebSocket, sid: str):
             if not text:
                 continue
 
-            # 如果会话还没有标题，用首条消息做标题
-            if session.title == "新对话":
+            if session.title in ("新对话", "历史会话"):
                 session.title = text[:30]
 
             session.updated_at = time.time()
+            if not session.first_user_ts:
+                session.first_user_ts = time.time()
             session.display_messages.append({"role": "user", "content": text, "ts": time.time()})
-            # Save user message to JSONL immediately
             if session.pi_session:
                 session.pi_session.append_message(UserMessage(content=[TextContent(text=text)]))
             await ws.send_text(json.dumps({
@@ -358,7 +604,6 @@ async def ws_endpoint(ws: WebSocket, sid: str):
             finally:
                 session.busy = False
 
-                # 压缩检查
                 try:
                     msgs = agent.state.messages
                     tokens = estimate_context_tokens(msgs)
@@ -370,11 +615,6 @@ async def ws_endpoint(ws: WebSocket, sid: str):
                             "before": before_t,
                             "after": after_t,
                         }, ensure_ascii=False))
-                        # 保存压缩点
-                        await session.compact_session(
-                            f"上下文压缩，保留最后 {len(new_msgs)} 条消息",
-                            new_msgs
-                        )
                 except Exception as ce:
                     await ws.send_text(json.dumps({
                         "type": "warn", "message": f"压缩失败: {ce}"
@@ -388,7 +628,6 @@ async def ws_endpoint(ws: WebSocket, sid: str):
 
 
 def serialize_event(ev) -> Optional[dict]:
-    """把 pi 的 event 转成前端可消费的 JSON。"""
     t = getattr(ev, "type", None)
 
     if t == "message_update":
