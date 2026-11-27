@@ -36,6 +36,35 @@ python hello_agent_loop.py
 ```
 
 
+# 运行 Web 聊天界面
+
+```shell
+conda activate zwq-kit
+python hello_agent_loop_web.py
+# 浏览器打开 http://127.0.0.1:8000
+```
+
+可用环境变量：`PI_WEB_HOST`（默认 `127.0.0.1`）、`PI_WEB_PORT`（默认 `8000`）。
+
+Web 相关代码全部位于 `web/`，便于维护：
+
+```
+web/
+├── app.py        FastAPI 路由、WebSocket、Origin 校验
+├── sessions.py   会话状态、展示消息、JSONL 持久化、多连接广播
+├── events.py     Agent 事件 → 前端 JSON 协议
+├── agent.py      Agent 工厂、上下文压缩
+├── config.py     路径 / 模型 / 工具 / 提示词
+└── static/
+    ├── index.html
+    ├── app.css
+    └── app.js
+```
+
+界面能力：会话列表与搜索、欢迎页快捷卡片、流式输出、可折叠思考过程、
+工具调用卡片（状态 / 耗时 / 参数 / 结果折叠与复制、天气专用卡）、停止生成、断线重连。
+
+
 # 存在问题 TODO
 1. web_search() 无法理解‘今天’、‘最近’的具体时间含义，读者需自行去除时间指代的歧义
 2. get_city_weather(), 目前只支持获取指定城市的实时天气，明天、几天后的天气 需自行实现

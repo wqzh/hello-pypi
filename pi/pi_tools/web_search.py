@@ -3,6 +3,7 @@ from pi.pi_ai import TextContent
 from pi.pi_agent_core import AgentToolResult
 
 from tavily import AsyncTavilyClient
+import asyncio
 import os
 
 class WebSearchTavilyTool:
@@ -28,13 +29,21 @@ class WebSearchTavilyTool:
     
     async def execute(self, tool_call_id, params, cancel_event=None, on_update=None):
         query = params['query']
-        
+
         # 调用 Tavily 搜索，max_results 可控制返回条数
-        response = await self.client.search(
-            query=query,
-            max_results=5,
-            search_depth="basic"  # basic(1 credit) 或 advanced(2 credits)
-        )
+        try:
+            response = await asyncio.wait_for(
+                self.client.search(
+                    query=query,
+                    max_results=5,
+                    search_depth="basic"  # basic(1 credit) 或 advanced(2 credits)
+                ),
+                timeout=20,
+            )
+        except asyncio.TimeoutError:
+            return AgentToolResult(content=[TextContent(text="联网搜索超时（20s），请稍后重试")])
+        except Exception as exc:  # noqa: BLE001
+            return AgentToolResult(content=[TextContent(text=f"联网搜索失败：{exc}")])
         
         # 提取结果，格式化为文本
         results = []

@@ -1,5 +1,33 @@
 # Changelog
 
+## [2026-11-27 Afternoon]
+
+refactor(web): 统一 Web 代码到 `web/` 目录，修复工具调用展示与历史回显
+
+- 目录重组（`hello_agent_loop_web.py` 仅保留启动入口）：
+  - `web/app.py`：FastAPI 路由、WebSocket、Origin 校验
+  - `web/sessions.py`：会话状态、展示消息、JSONL 持久化、多连接广播
+  - `web/events.py`：Agent 事件 → 前端 JSON 协议
+  - `web/agent.py`：Agent 工厂、上下文压缩
+  - `web/config.py`：路径 / 模型 / 工具 / 提示词配置
+  - `web/static/`：`index.html`、`app.css`、`app.js`
+- 修复：
+  - 工具块判别改为 `toolCall` / `toolResult`（原 `tool_call` / `tool_result` 永不命中，历史工具卡不出现）
+  - 事件协议携带 `tool_call_id`、`duration_ms`、`is_error`，并转发 `tool_execution_update`
+  - 每轮结束把完整 transcript（含 toolCall / toolResult）写回 JSONL，刷新/重启后可恢复
+  - 一个会话支持多个 WebSocket 订阅，断线后自动重连并对齐历史
+  - 错误 / 中断时清空流式缓冲，避免下一轮回答串台
+  - 删除会话时终止 Agent 并清理文件，避免幽灵会话
+  - 历史时间改用文件 mtime，标题写入 label 持久化
+  - 上下文压缩切点保留 toolResult 配对，压缩结果落盘为 compaction 条目
+  - 天气 / 联网搜索工具增加超时，避免工具卡长期停在「运行中」
+- UI（参考 NanoMate ExpertWorkbench）：
+  - 欢迎页 + 快捷卡片、头像气泡、可折叠思考过程
+  - ToolRunCard：状态徽章、耗时、参数 chips、结果折叠 / 复制、天气专用卡
+  - 圆角 composer + 圆形发送按钮 + 停止生成
+  - 助手文本轻量 Markdown 渲染（先转义，支持加粗 / 行内代码 / 代码块）
+  - 自动滚动仅在贴近底部时生效；窄屏（<1080px）隐藏侧栏
+
 ## [2026-09-17 Noon]
 feat(main-ui): overhaul web session handling and chat UI
 
