@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from typing import Any
 
 from pi.pi_ai import (
@@ -246,7 +247,9 @@ class Agent:
             return [
                 UserMessage(
                     content=[TextContent(text=message)],
-                    timestamp=int(asyncio.get_event_loop().time() * 1000),
+                    # 必须用墙钟时间：timestamp 字段约定为 Unix 毫秒，
+                    # 用 event loop 的单调时钟会得到不可读的小数值。
+                    timestamp=int(time.time() * 1000),
                 )
             ]
         if isinstance(message, list):

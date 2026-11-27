@@ -16,7 +16,7 @@
 - [x] Skill的加载, 集成 Skill 加载系统和3个初始 skill, 详见`.pi/skills/`目录
 - [ ] Extension加载
 - [x] 运行时compact
-- [ ] session持久化，对话恢复
+- [x] session持久化，对话恢复
 - [x] 增加`docs/`目录，python代码解读
 
 
@@ -52,17 +52,57 @@ Web 相关代码全部位于 `web/`，便于维护：
 web/
 ├── app.py        FastAPI 路由、WebSocket、Origin 校验
 ├── sessions.py   会话状态、展示消息、JSONL 持久化、多连接广播
-├── events.py     Agent 事件 → 前端 JSON 协议
-├── agent.py      Agent 工厂、上下文压缩
-├── config.py     路径 / 模型 / 工具 / 提示词
+├── events.py     Agent 事件 → 前端 JSON 协议（含 token / 缓存统计）
+├── agent.py      Agent 工厂、模型切换、上下文压缩
+├── config.py     路径 / 模型注册表 / 工具 / 提示词
 └── static/
     ├── index.html
     ├── app.css
     └── app.js
 ```
 
-界面能力：会话列表与搜索、欢迎页快捷卡片、流式输出、可折叠思考过程、
-工具调用卡片（状态 / 耗时 / 参数 / 结果折叠与复制、天气专用卡）、停止生成、断线重连。
+界面能力：会话列表与搜索（卡片显示年月日-时分，最近交互排最前）、欢迎页快捷卡片、
+流式输出、中间步骤（思考 + 工具调用）折叠区、每条消息的时间与 token/缓存命中统计、
+模型下拉切换、工具清单弹层、停止生成、断线重连。
+
+左侧「模型」页列出所有已加载模型，每行一个，行尾「测试连接」可探测可用性，
+支持「全部测试」；结果显示 HTTP 状态码（401 鉴权失败 / 403 无权限 / 404 接口不存在 /
+429 限流 / ERR 连接失败）、耗时与命中的鉴权方式。
+
+每行还有「获取模型」按钮：直接 `GET {BASE_URL}/models`，展开该地址下可用的模型列表
+（id + owned_by），同样支持三种鉴权依次尝试。
+
+思考型模型（如 LongCat-2.5）的 `reasoning_content` 会实时流式显示在折叠区，思考结束后立即折叠；
+若某轮只返回思考而没有正文，会展开思考并给出明确提示，不再出现“界面一片空白”。
+
+鉴权自动兼容两类服务：先试 `Authorization: Bearer <KEY>`，再试裸 `Authorization: <KEY>`，
+最后试 `api-key: <KEY>`；`/models` 不可用时退回 `/chat/completions`
+（`max_tokens=1`）。超时可用 `PI_MODEL_TEST_TIMEOUT`（默认 15 秒）调整。
+
+## 配置多个模型
+
+在 `.env` 中用 `PI_MODELS` 声明模型键，每个键对应一组 `PI_MODEL_<KEY>_*` 变量：
+
+```ini
+PI_MODELS=qwen35,deepseek
+PI_DEFAULT_MODEL=qwen35          # 可选，不填则取第一个
+
+PI_MODEL_QWEN35_NAME=Qwen3-35B
+PI_MODEL_QWEN35_MODEL_ID=qwen3-35b-a3b-gguf
+PI_MODEL_QWEN35_BASE_URL=http://127.0.0.1:9978/v1
+PI_MODEL_QWEN35_API_KEY=sk-xxx
+PI_MODEL_QWEN35_PROVIDER=wqzh-local
+
+PI_MODEL_DEEPSEEK_NAME=DeepSeek-Chat
+PI_MODEL_DEEPSEEK_MODEL_ID=deepseek-chat
+PI_MODEL_DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+PI_MODEL_DEEPSEEK_API_KEY=sk-yyy
+PI_MODEL_DEEPSEEK_PROVIDER=deepseek
+```
+
+下拉框显示的名称是「供应商/模型名」：供应商取 `PROVIDER`（留空则取 `BASE_URL` 的主机名），
+模型名取 `NAME`（留空则取 `MODEL_ID`）。每个会话独立记忆所选模型并写入会话元数据，
+重启后自动恢复。未配置 `PI_MODELS` 时仍按旧的 `PI_LLM_*` 单模型配置运行。
 
 
 # 存在问题 TODO

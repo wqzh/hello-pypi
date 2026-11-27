@@ -1,6 +1,11 @@
 /* ==========================================================================
  * Pi Agent · 前端交互
  * 依赖后端协议：web/events.py
+ *
+ * 交互约定
+ *   - 一轮对话 = 一条用户消息 + 其后的思考 / 工具调用 / 多段回答
+ *   - 中间步骤（思考 + 工具卡）收进折叠区，回答气泡才是最终结果
+ *   - 每条消息附「年月日 时分秒」；assistant 额外显示 token 与缓存命中率
  * ========================================================================== */
 
 const API = "";
@@ -44,14 +49,13 @@ const state = {
   sending: false,
   stick: true,
   query: "",
-  group: null,
-  groupBody: null,
-  textEl: null,
-  textBuffer: "",
-  thinkEl: null,
-  thinkStart: 0,
-  typingEl: null,
+  run: null,
   tools: new Map(),
+  meta: null,
+  models: [],
+  modelKey: "",
+  view: "chat",
+  testing: new Set(),
   reconnectTimer: null,
   refreshTimer: null,
 };
@@ -77,13 +81,25 @@ document.addEventListener("DOMContentLoaded", () => {
   dom.connText = $("connText");
   dom.searchInput = $("searchInput");
   dom.quickCards = $("quickCards");
-  dom.modelChip = $("modelChip");
+  dom.modelSelect = $("modelSelect");
   dom.toolChip = $("toolChip");
+  dom.toolChipText = $("toolChipText");
+  dom.toolsPop = $("toolsPop");
+  dom.toolsList = $("toolsList");
+  dom.toolsCount = $("toolsCount");
+  dom.toolsClose = $("toolsClose");
+  dom.main = $("main");
+  dom.navChat = $("navChat");
+  dom.navModels = $("navModels");
+  dom.modelsView = $("modelsView");
+  dom.modelList = $("modelList");
+  dom.modelsSub = $("modelsSub");
+  dom.testAllBtn = $("testAllBtn");
 
   renderQuickCards();
   bindEvents();
-  loadMeta();
-  refreshSessions().then(() => {
+  setView("chat");
+  loadMeta().then(refreshSessions).then(() => {
     if (state.sessions.length > 0) {
       openSession(state.sessions[0].id);
     } else {
@@ -93,6 +109,10 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 function bindEvents() {
+  dom.navChat.addEventListener("click", () => setView("chat"));
+  dom.navModels.addEventListener("click", () => setView("models"));
+  dom.testAllBtn.addEventListener("click", testAllModels);
+
   dom.newBtn.addEventListener("click", () => createSession());
   dom.sendBtn.addEventListener("click", send);
   dom.stopBtn.addEventListener("click", abortRun);
@@ -118,17 +138,81 @@ function bindEvents() {
       dom.scroll.scrollHeight - dom.scroll.scrollTop - dom.scroll.clientHeight;
     state.stick = distance < 90;
   });
+
+  dom.modelSelect.addEventListener("change", () => {
+    const key = dom.modelSelect.value;
+    if (!key || key === state.modelKey) return;
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      dom.modelSelect.value = state.modelKey;
+      setConn(false, "连接未就绪，无法切换模型");
+      return;
+    }
+    state.ws.send(JSON.stringify({ type: "set_model", model: key }));
+  });
+
+  dom.toolChip.addEventListener("click", (event) => {
+    event.stopPropagation();
+    dom.toolsPop.classList.toggle("hidden");
+  });
+  dom.toolsClose.addEventListener("click", () => dom.toolsPop.classList.add("hidden"));
+  document.addEventListener("click", (event) => {
+    if (dom.toolsPop.classList.contains("hidden")) return;
+    if (dom.toolsPop.contains(event.target) || dom.toolChip.contains(event.target)) return;
+    dom.toolsPop.classList.add("hidden");
+  });
 }
 
 async function loadMeta() {
   try {
     const meta = await apiGet("/api/meta");
-    const modelName = String(meta.model || "").split("/").pop();
-    dom.modelChip.textContent = modelName || "默认模型";
-    dom.toolChip.textContent = `${(meta.tools || []).length} 个工具`;
+    state.meta = meta;
+    state.models = meta.models || [];
+    state.modelKey = meta.model || "";
+    renderModelSelect(state.models, state.modelKey);
+    renderTools(meta.tools || []);
     dom.subtitle.textContent = `${meta.provider || "Pi"} · 流式输出 · 工具调用`;
+    if (state.view === "models") renderModelRows();
   } catch (error) {
     console.warn("加载元信息失败", error);
+  }
+}
+
+function renderModelSelect(models, selectedKey) {
+  dom.modelSelect.innerHTML = "";
+  for (const model of models) {
+    const option = document.createElement("option");
+    option.value = model.key;
+    option.textContent = model.label || model.model || model.key;
+    dom.modelSelect.append(option);
+  }
+  if (selectedKey && models.some((m) => m.key === selectedKey)) {
+    dom.modelSelect.value = selectedKey;
+  }
+}
+
+function selectModel(key) {
+  state.modelKey = key || state.modelKey;
+  if (key && state.models.some((m) => m.key === key)) {
+    dom.modelSelect.value = key;
+  }
+}
+
+function renderTools(tools) {
+  dom.toolChipText.textContent = `${tools.length} 个工具`;
+  dom.toolsCount.textContent = `（${tools.length}）`;
+  dom.toolsList.innerHTML = "";
+  for (const tool of tools) {
+    const meta = TOOL_META[tool.name] || {};
+    const row = el("div", "tool-item");
+    row.append(el("span", "tool-item-ico", meta.icon || "🛠"));
+    const body = el("div", "tool-item-body");
+    body.append(el("span", "tool-item-name", meta.label || tool.label || tool.name));
+    body.append(el("code", "tool-item-code", tool.name));
+    if (tool.description) {
+      body.append(el("span", "tool-item-desc", tool.description));
+    }
+    row.append(body);
+    dom.toolsList.append(row);
   }
 }
 
@@ -165,6 +249,30 @@ async function apiSend(path, options) {
   return response.json();
 }
 
+/* ---------------------------------------------------------------- 时间格式 */
+
+const pad2 = (n) => String(n).padStart(2, "0");
+
+/** 毫秒 → 2026-11-27 15:08 */
+function fmtMinute(ms) {
+  if (!ms) return "";
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/** 毫秒 → 2026-11-27 15:08:32 */
+function fmtSecond(ms) {
+  if (!ms) return "";
+  const d = new Date(ms);
+  return `${fmtMinute(ms)}:${pad2(d.getSeconds())}`;
+}
+
+function fmtNumber(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  return n.toLocaleString("en-US");
+}
+
 /* ---------------------------------------------------------------- 会话列表 */
 
 async function refreshSessions() {
@@ -179,7 +287,7 @@ async function refreshSessions() {
 
 function scheduleRefresh() {
   clearTimeout(state.refreshTimer);
-  state.refreshTimer = setTimeout(refreshSessions, 500);
+  state.refreshTimer = setTimeout(refreshSessions, 400);
 }
 
 function renderSessions() {
@@ -200,7 +308,12 @@ function renderSessions() {
 
     const body = el("div", "session-body");
     body.append(el("span", "session-title", item.title || "新对话"));
-    body.append(el("span", "session-time", relativeTime(item.updated_at)));
+
+    const metaRow = el("span", "session-meta");
+    // 年月日-时分
+    metaRow.append(el("span", "session-time", fmtMinute((item.updated_at || 0) * 1000)));
+    if (item.busy) metaRow.append(el("span", "session-busy", "生成中"));
+    body.append(metaRow);
 
     const del = el("button", "session-del", "✕");
     del.type = "button";
@@ -211,18 +324,11 @@ function renderSessions() {
     });
 
     row.append(body, del);
+    // 模型信息放 hover 提示，避免时间行拥挤
+    row.title = [item.title, item.model_label].filter(Boolean).join("\n");
     row.addEventListener("click", () => openSession(item.id));
     dom.sessionList.append(row);
   }
-}
-
-function relativeTime(seconds) {
-  if (!seconds) return "";
-  const diff = Date.now() - seconds * 1000;
-  if (diff < 60_000) return "刚刚";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
-  return new Date(seconds * 1000).toLocaleDateString("zh-CN");
 }
 
 function setActiveSession() {
@@ -235,10 +341,12 @@ function setActiveSession() {
 
 async function createSession() {
   try {
+    const payload = { title: "新对话" };
+    if (state.modelKey) payload.model = state.modelKey;
     const data = await apiSend("/api/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: "新对话" }),
+      body: JSON.stringify(payload),
     });
     await refreshSessions();
     await openSession(data.id);
@@ -252,8 +360,7 @@ async function openSession(sid) {
   state.sid = sid;
   setActiveSession();
   closeWs();
-  clearTyping();
-  resetGroup();
+  endRun({ removeEmpty: true });
 
   let data;
   try {
@@ -265,6 +372,7 @@ async function openSession(sid) {
   if (sequence !== state.openSeq) return;
 
   setTitle(data.title || "对话");
+  if (data.model_key) selectModel(data.model_key);
   renderHistory(data.messages || []);
   setBusy(Boolean(data.busy));
   connect(sid);
@@ -290,7 +398,7 @@ function resetView() {
   dom.title.textContent = "新对话";
   dom.messages.innerHTML = "";
   dom.welcome.classList.remove("hidden");
-  resetGroup();
+  endRun({ removeEmpty: true });
   state.tools.clear();
   setBusy(false);
 }
@@ -324,6 +432,7 @@ function connect(sid) {
         if (state.sid !== sid) return;
         renderHistory(data.messages || []);
         setTitle(data.title || "对话");
+        if (data.model_key) selectModel(data.model_key);
         setBusy(Boolean(data.busy));
       } catch (error) {
         /* 服务未就绪，继续重试 */
@@ -368,7 +477,8 @@ function handleEvent(data) {
   switch (data.type) {
     case "user":
       hideWelcome();
-      appendUser(data.text);
+      endRun({ removeEmpty: true });
+      appendUser(data.text, data.ts);
       if (data.title) setTitle(data.title);
       scheduleRefresh();
       break;
@@ -380,7 +490,7 @@ function handleEvent(data) {
       break;
 
     case "message_start":
-      if (data.role === "assistant") resetGroup();
+      if (data.role === "assistant") beginAssistantMessage();
       break;
 
     case "text_delta":
@@ -416,8 +526,13 @@ function handleEvent(data) {
     case "message_end":
       if (data.role === "assistant") {
         clearTyping();
-        resetGroup();
+        finishAssistantMessage(data);
       }
+      break;
+
+    case "model":
+      selectModel(data.key);
+      appendSystem(`已切换模型：${data.label || data.key}`);
       break;
 
     case "compact":
@@ -431,15 +546,35 @@ function handleEvent(data) {
     case "error":
       clearTyping();
       appendError(data.message);
-      resetGroup();
+      endRun({ removeEmpty: true });
       setBusy(false);
       break;
 
-    case "done":
+    case "done": {
       clearTyping();
+      const run = state.run;
+      const noAnswer = Boolean(run && !run.hasAnswer);
+      const hasSteps = Boolean(run && run.count > 0);
+      collapseSteps();
+      if (noAnswer && hasSteps) {
+        // 只有思考、没有正文：展开思考并明确提示，避免界面一片空白
+        run.steps.open = true;
+        run.answers.append(
+          el(
+            "div",
+            "empty-hint",
+            "模型只返回了思考内容，没有生成回答（通常是 max_tokens 被思考耗尽，可在 .env 调大 PI_LLM_MAX_TOKENS）。"
+          )
+        );
+      } else if (noAnswer) {
+        // 连思考都没有：本轮完全空白，给一条可见提示
+        appendError("模型本轮没有返回任何内容（content 为空），请重试或换用其他模型。");
+      }
+      endRun({ removeEmpty: true });
       setBusy(false);
       scheduleRefresh();
       break;
+    }
 
     case "deleted":
       if (state.sid === data.id) {
@@ -455,95 +590,176 @@ function handleEvent(data) {
   }
 }
 
+/* ---------------------------------------------------------------- 一轮对话容器 */
+
+function createRun() {
+  const root = el("div", "msg assistant run");
+  root.append(el("div", "avatar", "✦"));
+
+  const body = el("div", "body run-body");
+
+  const steps = document.createElement("details");
+  steps.className = "steps hidden";
+  steps.open = true;
+
+  const summary = document.createElement("summary");
+  summary.append(el("span", "steps-dot"));
+  const summaryText = el("span", "steps-text", "执行中…");
+  summary.append(summaryText);
+
+  const stepsBody = el("div", "steps-body");
+  steps.append(summary, stepsBody);
+
+  const answers = el("div", "answers");
+  body.append(steps, answers);
+  root.append(body);
+  dom.messages.append(root);
+
+  return {
+    root,
+    body,
+    steps,
+    summaryText,
+    stepsBody,
+    answers,
+    count: 0,
+    textEl: null,
+    textBuffer: "",
+    hasAnswer: false,
+    thinkingEl: null,
+    thinkStart: 0,
+    typingEl: null,
+  };
+}
+
+function ensureRun() {
+  if (!state.run) state.run = createRun();
+  return state.run;
+}
+
+function endRun(options = {}) {
+  const run = state.run;
+  if (!run) return;
+  if (run.typingEl) {
+    run.typingEl.remove();
+    run.typingEl = null;
+  }
+  if (
+    options.removeEmpty &&
+    run.count === 0 &&
+    run.answers.childNodes.length === 0
+  ) {
+    run.root.remove();
+  }
+  state.run = null;
+}
+
+function collapseSteps() {
+  for (const node of dom.messages.querySelectorAll(".steps")) {
+    node.open = false;
+  }
+}
+
+function updateStepsSummary(run) {
+  if (!run) return;
+  run.steps.classList.toggle("hidden", run.count === 0);
+  if (run.count === 0) return;
+  run.summaryText.textContent = `执行了 ${run.count} 个步骤`;
+  run.steps.classList.toggle("error", Boolean(run.hasError));
+}
+
+function addStepNode(node) {
+  const run = ensureRun();
+  run.count += 1;
+  run.stepsBody.append(node);
+  updateStepsSummary(run);
+  if (run.steps.open === false && state.sending) run.steps.open = true;
+  scrollBottom();
+}
+
 /* ---------------------------------------------------------------- 流式渲染 */
 
 function hideWelcome() {
   dom.welcome.classList.add("hidden");
 }
 
-function ensureGroup() {
-  if (state.group) return state.group;
-
-  const group = el("div", "msg assistant");
-  group.append(el("div", "avatar", "✦"));
-  const body = el("div", "body");
-  group.append(body);
-  dom.messages.append(group);
-
-  state.group = group;
-  state.groupBody = body;
-  state.textEl = null;
-  return group;
-}
-
-function resetGroup() {
-  if (state.typingEl) {
-    state.typingEl.remove();
-    state.typingEl = null;
-  }
-  // 只含头像/占位的空分组直接移除，避免留下空白气泡
-  if (state.group && state.groupBody && state.groupBody.childNodes.length === 0) {
-    state.group.remove();
-  }
-  state.group = null;
-  state.groupBody = null;
-  state.textEl = null;
-  state.textBuffer = "";
-  state.thinkEl = null;
-}
-
 function showTyping() {
-  ensureGroup();
-  if (state.textEl || state.typingEl) return;
+  const run = ensureRun();
+  if (run.textEl || run.typingEl) return;
   const typing = el("div", "typing");
   typing.append(el("i"), el("i"), el("i"));
-  state.groupBody.append(typing);
-  state.typingEl = typing;
+  run.answers.append(typing);
+  run.typingEl = typing;
 }
 
 function clearTyping() {
-  if (state.typingEl) {
-    state.typingEl.remove();
-    state.typingEl = null;
+  const run = state.run;
+  if (run && run.typingEl) {
+    run.typingEl.remove();
+    run.typingEl = null;
   }
+}
+
+function beginAssistantMessage() {
+  const run = ensureRun();
+  run.textEl = null;
+  run.textBuffer = "";
 }
 
 function appendDelta(delta) {
   if (!delta) return;
-  ensureGroup();
-  if (!state.textEl) {
-    state.textEl = el("div", "chat-text");
-    state.groupBody.append(state.textEl);
+  const run = ensureRun();
+  if (!run.textEl) {
+    run.textEl = el("div", "chat-text");
+    run.answers.append(run.textEl);
   }
-  state.textBuffer += delta;
-  state.textEl.innerHTML = renderMarkdown(state.textBuffer);
+  run.textBuffer += delta;
+  run.hasAnswer = true;
+  run.textEl.innerHTML = renderMarkdown(run.textBuffer);
   scrollBottom();
 }
 
-function startThinking() {
-  ensureGroup();
-  if (state.thinkEl) return;
-  const details = document.createElement("details");
-  details.className = "think";
-  details.open = true;
-
-  const summary = document.createElement("summary");
-  const spinner = el("span", "spin");
-  summary.append(spinner, document.createTextNode(" 思考中…"));
-
-  const body = el("div", "think-body");
-  details.append(summary, body);
-  state.groupBody.append(details);
-
-  state.thinkEl = details;
-  state.thinkStart = Date.now();
+function finishAssistantMessage(data) {
+  const run = state.run;
+  if (!run) return;
+  const usage = data.usage || {};
+  if (run.textEl) {
+    run.answers.append(buildMessageMeta(Date.now(), usage));
+  } else if (run.count === 0 && run.answers.childNodes.length === 0) {
+    updateStepsSummary(run);
+  }
+  run.textEl = null;
+  run.textBuffer = "";
+  updateStepsSummary(run);
   scrollBottom();
+}
+
+/* ---------------------------------------------------------------- 思考过程 */
+
+function startThinking() {
+  const run = ensureRun();
+  if (run.thinkingEl) return;
+
+  const details = document.createElement("details");
+  details.className = "step step-think";
+  const summary = document.createElement("summary");
+  summary.append(el("span", "step-ico", "✳"));
+  const label = el("span", "step-title", "思考中…");
+  summary.append(label, el("span", "spin"));
+  const body = el("div", "step-body");
+  details.append(summary, body);
+
+  run.thinkingEl = details;
+  run.thinkLabel = label;
+  run.thinkStart = Date.now();
+  addStepNode(details);
 }
 
 function appendThinking(delta) {
   if (!delta) return;
-  if (!state.thinkEl) startThinking();
-  const body = state.thinkEl.querySelector(".think-body");
+  const run = state.run;
+  if (!run || !run.thinkingEl) startThinking();
+  const body = state.run.thinkingEl.querySelector(".step-body");
   if (body) {
     body.textContent += delta;
     scrollBottom();
@@ -551,14 +767,42 @@ function appendThinking(delta) {
 }
 
 function endThinking() {
-  if (!state.thinkEl) return;
-  const seconds = ((Date.now() - state.thinkStart) / 1000).toFixed(1);
-  const summary = state.thinkEl.querySelector("summary");
-  if (summary) {
-    summary.textContent = `已思考 ${seconds}s`;
+  const run = state.run;
+  if (!run || !run.thinkingEl) return;
+  const seconds = ((Date.now() - run.thinkStart) / 1000).toFixed(1);
+  if (run.thinkLabel) run.thinkLabel.textContent = `思考 ${seconds}s`;
+  const spinner = run.thinkingEl.querySelector(".spin");
+  if (spinner) spinner.remove();
+  // 思考结束立即折叠（用户可随时展开）；若本轮无正文，done 时会重新展开并提示
+  run.thinkingEl.open = false;
+  run.thinkingEl = null;
+  run.thinkLabel = null;
+}
+
+/* ---------------------------------------------------------------- 消息 meta */
+
+function buildMessageMeta(ms, usage) {
+  const meta = el("div", "msg-meta");
+  meta.append(el("span", "meta-time", fmtSecond(ms)));
+
+  if (usage && (usage.input || usage.output)) {
+    meta.append(el("span", "meta-dot", "·"));
+    meta.append(el("span", "meta-token", `输入 ${fmtNumber(usage.input)}`));
+    meta.append(el("span", "meta-dot", "·"));
+    meta.append(el("span", "meta-token", `输出 ${fmtNumber(usage.output)}`));
+    if (usage.cache_read) {
+      const rate = Number(usage.cache_hit_rate || 0) * 100;
+      meta.append(el("span", "meta-dot", "·"));
+      const cache = el(
+        "span",
+        "meta-token meta-cache",
+        `缓存命中 ${rate.toFixed(0)}%`
+      );
+      cache.title = `缓存读取 ${fmtNumber(usage.cache_read)} / 缓存写入 ${fmtNumber(usage.cache_write)}`;
+      meta.append(cache);
+    }
   }
-  state.thinkEl.open = false;
-  state.thinkEl = null;
+  return meta;
 }
 
 /* ---------------------------------------------------------------- 工具卡 */
@@ -639,35 +883,36 @@ function block(labelText, preText, withCopy = false) {
   return wrapper;
 }
 
+/**
+ * 工具卡（步骤内用，不含头像 / 外层 msg）
+ * 返回 { card, statusEl, durationEl, resultEl }
+ */
 function buildToolCard(data) {
   const name = data.tool_name || "";
   const meta = toolMeta(name);
+  const status = data.status || "running";
 
-  const message = el("div", "msg tool");
-  message.dataset.callId = data.tool_call_id || "";
-  message.append(el("div", "avatar", meta.icon));
-
-  const wrapper = el("div", "body");
-  const card = el("div", "tool-card");
-  card.dataset.state = data.status || "running";
+  const card = el("div", "tool-card step");
+  card.dataset.state = status;
 
   const head = el("div", "tool-head");
+  head.append(el("span", "step-ico", meta.icon));
   head.append(el("span", "tool-title", meta.label));
   head.append(el("code", "tool-name", name || "tool"));
 
-  const status = statusNode(data.status || "running");
-  head.append(status);
-  const duration = el("span", "tool-dur", "");
-  head.append(duration);
+  const statusEl = statusNode(status);
+  head.append(statusEl);
+  const durationEl = el("span", "tool-dur", "");
+  head.append(durationEl);
 
   const toggle = el("button", "tool-toggle", "展开");
   toggle.type = "button";
-  toggle.addEventListener("click", () => {
+  toggle.addEventListener("click", (event) => {
+    event.stopPropagation();
     const expanded = card.classList.toggle("expanded");
     toggle.textContent = expanded ? "收起" : "展开";
   });
   head.append(toggle);
-
   card.append(head);
 
   const argsRow = el("div", "tool-args");
@@ -689,13 +934,26 @@ function buildToolCard(data) {
   card.append(body);
 
   if (data.duration_ms) {
-    duration.textContent = `${(data.duration_ms / 1000).toFixed(1)}s`;
+    durationEl.textContent = `${(data.duration_ms / 1000).toFixed(1)}s`;
   }
 
-  wrapper.append(card);
-  message.append(wrapper);
+  return {
+    card,
+    statusEl,
+    durationEl,
+    resultEl: card.querySelector(".tool-pre.result"),
+  };
+}
 
-  return { message, card, status, duration };
+function applyToolResult(built, status, result, durationMs) {
+  built.card.dataset.state = status === "running" ? "done" : status;
+  const fresh = statusNode(status === "running" ? "done" : status);
+  built.statusEl.replaceWith(fresh);
+  built.statusEl = fresh;
+  if (durationMs) {
+    built.durationEl.textContent = `${(durationMs / 1000).toFixed(1)}s`;
+  }
+  if (built.resultEl) built.resultEl.textContent = result || "（无输出）";
 }
 
 function buildWeather(raw) {
@@ -722,6 +980,7 @@ function buildWeather(raw) {
 
 function addTool(data) {
   hideWelcome();
+  clearTyping();
   const built = buildToolCard({
     tool_call_id: data.tool_call_id,
     tool_name: data.tool_name,
@@ -729,7 +988,7 @@ function addTool(data) {
     status: "running",
     result: "",
   });
-  dom.messages.append(built.message);
+  addStepNode(built.card);
   state.tools.set(data.tool_call_id || data.tool_name, built);
   scrollBottom();
 }
@@ -737,9 +996,8 @@ function addTool(data) {
 function updateTool(data) {
   const key = data.tool_call_id || "";
   const built = state.tools.get(key) || state.tools.get(data.tool_name || "");
-  if (!built) return;
-  const pre = built.card.querySelector(".tool-pre.result");
-  if (pre) pre.textContent = data.partial || "";
+  if (!built || !built.resultEl) return;
+  built.resultEl.textContent = data.partial || "";
 }
 
 function finishTool(data) {
@@ -749,16 +1007,17 @@ function finishTool(data) {
   state.tools.delete(key);
   state.tools.delete(data.tool_name || "");
 
-  built.card.dataset.state = data.is_error ? "error" : "done";
-  built.status.replaceWith(statusNode(data.is_error ? "error" : "done"));
-  built.status = built.card.querySelector(".tool-status");
+  applyToolResult(
+    built,
+    data.is_error ? "error" : "done",
+    data.result,
+    data.duration_ms
+  );
 
-  if (data.duration_ms) {
-    built.duration.textContent = `${(data.duration_ms / 1000).toFixed(1)}s`;
+  if (data.is_error && state.run) {
+    state.run.hasError = true;
+    updateStepsSummary(state.run);
   }
-
-  const pre = built.card.querySelector(".tool-pre.result");
-  if (pre) pre.textContent = data.result || "（无输出）";
 
   if (data.tool_name === "get_city_weather" && data.result) {
     const old = built.card.querySelector(".weather-card");
@@ -773,7 +1032,7 @@ function finishTool(data) {
 function renderHistory(messages) {
   dom.messages.innerHTML = "";
   state.tools.clear();
-  resetGroup();
+  state.run = null;
 
   if (!messages || messages.length === 0) {
     dom.welcome.classList.remove("hidden");
@@ -781,35 +1040,63 @@ function renderHistory(messages) {
   }
   dom.welcome.classList.add("hidden");
 
+  let run = null;
+
   for (const message of messages) {
     switch (message.role) {
       case "user":
+        run = null;
         appendUser(message.text, message.ts);
         break;
 
-      case "assistant":
-        appendAssistantHistory(message);
-        break;
-
-      case "tool":
-        {
-          const built = buildToolCard({
-            tool_call_id: message.tool_call_id,
-            tool_name: message.tool_name,
-            args: message.args,
-            status: message.status === "running" ? "done" : message.status || "done",
-            result: message.result,
-            duration_ms: message.duration_ms,
-          });
-          if (message.status === "running") {
-            built.card.dataset.state = "done";
-            built.status.replaceWith(statusNode("done"));
-          }
-          dom.messages.append(built.message);
+      case "assistant": {
+        run = run || createRun();
+        if (message.thinking && message.thinking.trim()) {
+          const details = document.createElement("details");
+          details.className = "step step-think";
+          const summary = document.createElement("summary");
+          summary.append(el("span", "step-ico", "✳"));
+          summary.append(el("span", "step-title", "思考过程"));
+          const body = el("div", "step-body", message.thinking.trim());
+          details.append(summary, body);
+          run.count += 1;
+          run.stepsBody.append(details);
+          updateStepsSummary(run);
+        }
+        if (message.text && message.text.trim()) {
+          const bubble = el("div", "chat-text");
+          bubble.innerHTML = renderMarkdown(message.text);
+          run.answers.append(bubble);
+          run.answers.append(buildMessageMeta(message.ts, message.usage));
         }
         break;
+      }
+
+      case "tool": {
+        run = run || createRun();
+        const built = buildToolCard({
+          tool_call_id: message.tool_call_id,
+          tool_name: message.tool_name,
+          args: message.args,
+          status: message.status === "running" ? "done" : message.status || "done",
+          result: message.result,
+          duration_ms: message.duration_ms,
+        });
+        applyToolResult(
+          built,
+          message.status === "running" ? "done" : message.status || "done",
+          message.result,
+          message.duration_ms
+        );
+        if (message.status === "error") run.hasError = true;
+        run.count += 1;
+        run.stepsBody.append(built.card);
+        updateStepsSummary(run);
+        break;
+      }
 
       case "system":
+        run = null;
         appendSystem(message.text);
         break;
 
@@ -817,7 +1104,29 @@ function renderHistory(messages) {
         break;
     }
   }
+
+  collapseSteps();
+  markEmptyAnswers();
   scrollBottom(true);
+}
+
+/** 历史回显：只有思考、没有正文的轮次展开思考并给提示 */
+function markEmptyAnswers() {
+  for (const runEl of dom.messages.querySelectorAll(".msg.assistant.run")) {
+    const steps = runEl.querySelector(".steps");
+    const answers = runEl.querySelector(".answers");
+    if (!steps || !answers) continue;
+    if (steps.classList.contains("hidden")) continue;
+    if (answers.querySelector(".chat-text")) continue;
+    steps.open = true;
+    answers.append(
+      el(
+        "div",
+        "empty-hint",
+        "该轮模型只返回了思考内容，没有生成回答。"
+      )
+    );
+  }
 }
 
 function appendUser(text, ts) {
@@ -826,37 +1135,11 @@ function appendUser(text, ts) {
   message.append(el("div", "avatar", "我"));
   const body = el("div", "body");
   const bubble = el("div", "chat-text", text || "");
-  if (ts) bubble.title = new Date(ts).toLocaleString("zh-CN");
   body.append(bubble);
+  if (ts) body.append(buildMessageMeta(ts, null));
   message.append(body);
   dom.messages.append(message);
   scrollBottom();
-}
-
-function appendAssistantHistory(message) {
-  const group = el("div", "msg assistant");
-  group.append(el("div", "avatar", "✦"));
-  const body = el("div", "body");
-
-  if (message.thinking && message.thinking.trim()) {
-    const details = document.createElement("details");
-    details.className = "think";
-    const summary = el("summary", "", "思考过程");
-    const thinkBody = el("div", "think-body", message.thinking.trim());
-    details.append(summary, thinkBody);
-    body.append(details);
-  }
-
-  if (message.text && message.text.trim()) {
-    const bubble = el("div", "chat-text");
-    bubble.innerHTML = renderMarkdown(message.text);
-    body.append(bubble);
-  }
-
-  if (body.childNodes.length > 0) {
-    group.append(body);
-    dom.messages.append(group);
-  }
 }
 
 function appendSystem(text) {
@@ -916,6 +1199,7 @@ function setBusy(busy, hint) {
   dom.sendBtn.disabled = busy;
   dom.busyBadge.classList.toggle("hidden", !busy);
   dom.stopBtn.classList.toggle("hidden", !busy);
+  dom.modelSelect.disabled = busy;
   if (busy) {
     state.stick = true;
   } else {
@@ -957,4 +1241,253 @@ function renderMarkdown(text) {
 function autoResize() {
   dom.input.style.height = "auto";
   dom.input.style.height = `${Math.min(dom.input.scrollHeight, 200)}px`;
+}
+
+/* ---------------------------------------------------------------- 视图切换 */
+
+const STATUS_TEXT = {
+  0: "连接失败",
+  400: "请求格式错误",
+  401: "鉴权失败（KEY 无效）",
+  403: "无权限",
+  404: "接口不存在",
+  405: "方法不允许",
+  413: "请求过大",
+  429: "触发限流",
+  500: "服务端错误",
+  502: "网关错误",
+  503: "服务不可用",
+  504: "网关超时",
+};
+
+const AUTH_LABEL = {
+  bearer: "Bearer",
+  raw: "裸 KEY",
+  "api-key": "api-key",
+  none: "无鉴权",
+};
+
+function setView(view) {
+  const isModels = view === "models";
+  state.view = view;
+  dom.main.classList.toggle("view-models", isModels);
+  dom.navChat.classList.toggle("active", !isModels);
+  dom.navModels.classList.toggle("active", isModels);
+
+  if (isModels) {
+    dom.title.textContent = "模型";
+    dom.subtitle.textContent = "连通性测试 · 逐个验证";
+    dom.clearBtn.classList.add("hidden");
+    dom.stopBtn.classList.add("hidden");
+    dom.busyBadge.classList.add("hidden");
+    renderModelRows();
+    return;
+  }
+
+  // 回到对话：恢复标题、操作按钮与输入态
+  const current = state.sessions.find((item) => item.id === state.sid);
+  dom.title.textContent = current?.title || "新对话";
+  dom.subtitle.textContent = `${state.meta?.provider || "Pi"} · 流式输出 · 工具调用`;
+  dom.clearBtn.classList.toggle("hidden", !state.sid);
+  setBusy(state.sending);
+}
+
+function renderModelRows() {
+  const models = state.models || [];
+  dom.modelsSub.textContent = `共 ${models.length} 个模型 · 点击右侧按钮测试连通性`;
+  dom.modelList.innerHTML = "";
+
+  if (models.length === 0) {
+    dom.modelList.append(
+      el("div", "rail-empty", "没有加载到模型\n请在 .env 中配置 PI_LLM_* 或 PI_MODELS")
+    );
+    return;
+  }
+
+  for (const model of models) {
+    const item = el("div", "model-item");
+
+    const row = el("div", "model-row");
+    row.dataset.key = model.key;
+
+    const info = el("div", "model-info");
+    const name = el("div", "model-name");
+    name.append(el("span", "", model.label || model.model || model.key));
+    if (model.key === state.modelKey) name.append(el("span", "model-tag", "当前"));
+    info.append(name);
+
+    const metaParts = [model.model || model.key, model.provider || "-"];
+    if (model.base_url) metaParts.push(model.base_url);
+    if (!model.has_key) metaParts.push("无 KEY");
+    info.append(el("div", "model-meta", metaParts.join("  ·  ")));
+
+    const result = el("div", "model-result");
+
+    const actions = el("div", "model-actions");
+    const remote = el("div", "model-remote hidden");
+
+    const listBtn = el("button", "btn model-remote-btn", "获取模型");
+    listBtn.type = "button";
+    listBtn.title = "GET {BASE_URL}/models";
+    listBtn.addEventListener("click", () =>
+      fetchRemoteModels(model.key, listBtn, remote)
+    );
+
+    const testBtn = el("button", "btn model-test-btn", "测试连接");
+    testBtn.type = "button";
+    testBtn.addEventListener("click", () => testModel(model.key, testBtn, result, row));
+
+    actions.append(listBtn, testBtn);
+    row.append(info, result, actions);
+    item.append(row, remote);
+    dom.modelList.append(item);
+  }
+}
+
+async function fetchRemoteModels(key, button, remoteEl) {
+  if (remoteEl.dataset.loading === "1") return;
+
+  // 已获取过：直接展开/收起
+  if (remoteEl.dataset.loaded === "1") {
+    remoteEl.classList.toggle("hidden");
+    button.textContent = remoteEl.classList.contains("hidden") ? "获取模型" : "收起";
+    return;
+  }
+
+  remoteEl.dataset.loading = "1";
+  button.disabled = true;
+  button.textContent = "获取中…";
+  remoteEl.classList.remove("hidden");
+  remoteEl.innerHTML = "";
+
+  const pending = el("div", "remote-status");
+  pending.append(el("span", "spin"), document.createTextNode("正在请求 /models…"));
+  remoteEl.append(pending);
+
+  try {
+    const data = await apiSend(`/api/models/${encodeURIComponent(key)}/remote`, {
+      method: "POST",
+    });
+    renderRemoteModels(remoteEl, data);
+  } catch (error) {
+    renderRemoteModels(remoteEl, {
+      ok: false,
+      status: 0,
+      detail: String(error.message || error),
+      models: [],
+    });
+  } finally {
+    remoteEl.dataset.loading = "0";
+    remoteEl.dataset.loaded = "1";
+    button.disabled = false;
+    button.textContent = "收起";
+  }
+}
+
+function renderRemoteModels(container, data) {
+  container.innerHTML = "";
+
+  const head = el("div", "remote-head");
+  if (data.ok) {
+    const badge = el("span", "badge green");
+    badge.textContent = `✓ ${data.count} 个模型`;
+    if (data.latency_ms) badge.textContent += ` · ${data.latency_ms}ms`;
+    head.append(badge);
+    head.append(
+      el("span", "remote-auth", `鉴权：${AUTH_LABEL[data.auth] || data.auth || "-"}`)
+    );
+  } else {
+    const badge = el("span", "badge red");
+    const code = data.status || "ERR";
+    badge.textContent = `${code} · ${STATUS_TEXT[data.status] || "获取失败"}`;
+    head.append(badge);
+    if (data.detail) head.append(el("span", "remote-detail", data.detail));
+  }
+  container.append(head);
+
+  if (!data.ok || !data.models?.length) return;
+
+  const grid = el("div", "remote-grid");
+  for (const model of data.models) {
+    const chip = el("div", "remote-chip");
+    chip.append(el("code", "remote-id", model.id));
+    if (model.owned_by) chip.append(el("span", "remote-owner", model.owned_by));
+    chip.title = model.id;
+    grid.append(chip);
+  }
+  container.append(grid);
+}
+
+async function testModel(key, button, resultEl, row) {
+  if (state.testing.has(key)) return;
+  state.testing.add(key);
+  button.disabled = true;
+  button.textContent = "测试中…";
+  resultEl.innerHTML = "";
+  row.dataset.state = "";
+
+  const pending = el("span", "badge gray");
+  pending.append(el("span", "spin"), document.createTextNode("连接中"));
+  resultEl.append(pending);
+
+  try {
+    const data = await apiSend(`/api/models/${encodeURIComponent(key)}/test`, {
+      method: "POST",
+    });
+    renderTestResult(resultEl, row, data);
+  } catch (error) {
+    renderTestResult(resultEl, row, {
+      ok: false,
+      status: 0,
+      detail: String(error.message || error),
+    });
+  } finally {
+    state.testing.delete(key);
+    button.disabled = false;
+    button.textContent = "重新测试";
+  }
+}
+
+function renderTestResult(resultEl, row, data) {
+  resultEl.innerHTML = "";
+  row.dataset.state = data.ok ? "ok" : "fail";
+
+  const badge = el("span", "badge " + (data.ok ? "green" : "red"));
+  if (data.ok) {
+    const parts = ["✓ 可用", `HTTP ${data.status ?? 200}`];
+    if (data.latency_ms) parts.push(`${data.latency_ms}ms`);
+    if (data.auth) parts.push(AUTH_LABEL[data.auth] || data.auth);
+    badge.textContent = parts.join(" · ");
+  } else {
+    const code = data.status || "ERR";
+    badge.textContent = `${code} · ${STATUS_TEXT[data.status] || "请求失败"}`;
+  }
+  resultEl.append(badge);
+
+  const detailText = data.detail || "";
+  if (detailText) {
+    const detail = el(
+      "div",
+      "model-result-detail" + (data.ok ? "" : " err"),
+      detailText
+    );
+    detail.title = detailText;
+    resultEl.append(detail);
+  }
+}
+
+async function testAllModels() {
+  const rows = [...dom.modelList.querySelectorAll(".model-row")];
+  if (rows.length === 0) return;
+  dom.testAllBtn.disabled = true;
+  try {
+    // 串行探测，避免同时打满上游限流
+    for (const row of rows) {
+      const button = row.querySelector(".model-test-btn");
+      const result = row.querySelector(".model-result");
+      if (button && result) await testModel(row.dataset.key, button, result, row);
+    }
+  } finally {
+    dom.testAllBtn.disabled = false;
+  }
 }

@@ -1,7 +1,7 @@
-"""Web 层公共配置：路径、模型、工具、系统提示词。
+"""Web 层公共配置：路径、模型注册表、工具、系统提示词。
 
 所有 Web 相关代码统一放在 ``web/`` 下：
-    web/config.py    路径与运行时配置
+    web/config.py    路径与运行时配置、模型注册表
     web/events.py    Agent 事件 → WebSocket JSON 协议
     web/sessions.py  会话状态、展示消息、持久化
     web/agent.py     Agent 工厂与上下文压缩
@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pi.pi_ai import Model
@@ -31,7 +32,7 @@ from pi.pi_coding_agent.tools import (
     WriteTool,
 )
 
-from load_env import load_env_config
+from load_env import load_models
 
 # ---------------------------------------------------------------- 路径
 
@@ -41,21 +42,58 @@ SESSIONS_DIR = BASE_DIR / ".pi" / "sessions"
 
 # ---------------------------------------------------------------- 模型
 
-API_KEY, MODEL_CONFIG = load_env_config()
+#: 每个模型：key / label（供应商/模型名）/ Model 实例 / api_key
+MODELS: list[dict] = []
+MODEL_INDEX: dict[str, dict] = {}
 
-model = Model(
-    id=MODEL_CONFIG["id"],
-    name=MODEL_CONFIG["name"],
-    base_url=MODEL_CONFIG["base_url"],
-    api=MODEL_CONFIG["api"],
-    provider=MODEL_CONFIG["provider"],
-    input=["text"],
-    context_window=MODEL_CONFIG["context_window"],
-    max_tokens=MODEL_CONFIG["max_tokens"],
-    reasoning=MODEL_CONFIG["reasoning"],
-)
+for _entry in load_models():
+    _entry["model"] = Model(
+        id=_entry["id"],
+        name=_entry["name"],
+        base_url=_entry["base_url"],
+        api=_entry["api"],
+        provider=_entry["provider"],
+        input=["text"],
+        context_window=_entry["context_window"],
+        max_tokens=_entry["max_tokens"],
+        reasoning=_entry["reasoning"],
+    )
+    MODELS.append(_entry)
+    MODEL_INDEX[_entry["key"]] = _entry
 
-print(f"[INFO] 模型配置: {model.id} @ {model.base_url}")
+if not MODELS:  # load_models 已 raise，这里只是防御
+    raise RuntimeError("没有可用模型，请检查 .env")
+
+DEFAULT_MODEL_KEY = MODELS[0]["key"]
+DEFAULT_MODEL = MODELS[0]
+
+for _entry in MODELS:
+    print(f"[INFO] 模型: {_entry['label']}  ({_entry['id']} @ {_entry['base_url']})")
+
+
+def get_model(key: str | None) -> dict:
+    """按 key 取模型；未知 key 回落到默认模型。"""
+    if key and key in MODEL_INDEX:
+        return MODEL_INDEX[key]
+    return DEFAULT_MODEL
+
+
+def model_public_list() -> list[dict]:
+    """给前端的模型列表（不含密钥）。"""
+    return [
+        {
+            "key": m["key"],
+            "label": m["label"],
+            "provider": m["provider"],
+            "model": m["name"],
+            "base_url": m["base_url"],
+            "context_window": m["context_window"],
+            "max_tokens": m["max_tokens"],
+            "has_key": bool(m.get("api_key")),
+        }
+        for m in MODELS
+    ]
+
 
 # ---------------------------------------------------------------- 工具
 
@@ -71,6 +109,22 @@ PI_BUILTIN_TOOLS = [
 
 TOOLS = [GetCityWeatherTool(), WebSearchTavilyTool()] + PI_BUILTIN_TOOLS
 TOOL_NAMES = [tool.name for tool in TOOLS]
+
+
+def tool_public_list() -> list[dict]:
+    """给前端的工具清单：名称 + 中文说明。"""
+    items = []
+    for tool in TOOLS:
+        description = (getattr(tool, "description", "") or "").strip()
+        items.append(
+            {
+                "name": tool.name,
+                "label": (getattr(tool, "label", "") or tool.name),
+                "description": description.split("\n")[0][:160],
+            }
+        )
+    return items
+
 
 # ---------------------------------------------------------------- 提示词
 

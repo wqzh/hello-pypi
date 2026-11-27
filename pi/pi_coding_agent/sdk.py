@@ -11,7 +11,7 @@ Agent + 编码工具集 + 默认 system prompt，让用户几行代码就能跑�
 
 from __future__ import annotations
 
-import asyncio
+import time
 from typing import Any
 
 from pi.pi_agent_core import Agent, AgentOptions, AgentTool
@@ -98,7 +98,7 @@ class CodingAgent:
         self._agent.steer(
             UserMessage(
                 content=[TextContent(text=message)],
-                timestamp=int(asyncio.get_event_loop().time() * 1000),
+                timestamp=int(time.time() * 1000),
             )
         )
 
@@ -109,7 +109,7 @@ class CodingAgent:
         self._agent.follow_up(
             UserMessage(
                 content=[TextContent(text=message)],
-                timestamp=int(asyncio.get_event_loop().time() * 1000),
+                timestamp=int(time.time() * 1000),
             )
         )
 

@@ -6,7 +6,8 @@
     {"type": "user",         "text", "ts", "title"}
     {"type": "busy",         "value": true|false}
     {"type": "message_start","role"}
-    {"type": "message_end",  "role", "stop_reason", "usage", "error"}
+    {"type": "message_end",  "role", "stop_reason", "usage", "model",
+                             "provider", "error"}
     {"type": "text_delta",   "delta"}
     {"type": "thinking_start" | "thinking_delta" | "thinking_end"}
     {"type": "tool_start",   "tool_call_id", "tool_name", "args"}
@@ -70,15 +71,37 @@ def result_text(result: Any) -> str:
     return str(content)
 
 
-def _usage(msg: Any) -> dict:
+def usage_dict(msg: Any) -> dict:
+    """AssistantMessage.usage → 前端可用的 token 统计（含缓存命中）。"""
     usage = _get(msg, "usage", default=None)
     if usage is None:
         return {}
+
+    input_tokens = int(_get(usage, "input", default=0) or 0)
+    output_tokens = int(_get(usage, "output", default=0) or 0)
+    cache_read = int(_get(usage, "cache_read", "cacheRead", default=0) or 0)
+    cache_write = int(_get(usage, "cache_write", "cacheWrite", default=0) or 0)
+    total = int(_get(usage, "total_tokens", "totalTokens", default=0) or 0)
+    if not total:
+        total = input_tokens + output_tokens + cache_read + cache_write
+
+    # 缓存命中率：命中数 / 本次读入的 prompt token 总量
+    prompt_tokens = input_tokens + cache_read
+    cache_hit_rate = (cache_read / prompt_tokens) if prompt_tokens else 0.0
+
     return {
-        "input": _get(usage, "input", default=0) or 0,
-        "output": _get(usage, "output", default=0) or 0,
-        "total": _get(usage, "total_tokens", "totalTokens", default=0) or 0,
+        "input": input_tokens,
+        "output": output_tokens,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+        "total": total,
+        "cache_hit_rate": round(cache_hit_rate, 4),
     }
+
+
+def _usage(msg: Any) -> dict:
+    """兼容旧调用点。"""
+    return usage_dict(msg)
 
 
 def serialize_event(ev: Any) -> Optional[dict]:
@@ -112,7 +135,9 @@ def serialize_event(ev: Any) -> Optional[dict]:
             "type": "message_end",
             "role": _get(msg, "role", default=""),
             "stop_reason": _get(msg, "stop_reason", "stopReason", default=""),
-            "usage": _usage(msg),
+            "usage": usage_dict(msg),
+            "model": _get(msg, "model", default=""),
+            "provider": _get(msg, "provider", default=""),
             "error": _get(msg, "error_message", "errorMessage", default=None),
         }
 

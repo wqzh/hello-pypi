@@ -26,8 +26,8 @@ from pi.pi_ai import (
     UserMessage,
 )
 
-from .config import SESSIONS_DIR
-from .events import serialize_event
+from .config import DEFAULT_MODEL_KEY, SESSIONS_DIR
+from .events import serialize_event, usage_dict
 
 log = logging.getLogger("pi.web.sessions")
 
@@ -53,6 +53,23 @@ def _ts_ms(value: Any) -> float:
         except Exception:
             pass
     return time.time() * 1000
+
+
+def _message_ts(msg: Any, fallback: float) -> float:
+    """消息自身的时间戳（Unix 毫秒）优先，退回条目时间。
+
+    消息是写完整个回合才批量落盘的，条目的 ``timestamp`` 因此全部挤在
+    同一个时刻；真正能区分「提问」与「回答」的是消息自带的 ``timestamp``。
+    """
+    raw = _f(msg, "timestamp", 0)
+    try:
+        value = float(raw or 0)
+    except (TypeError, ValueError):
+        return fallback
+    # 只接受合理的 Unix 毫秒（2001 年以后、2100 年以前）
+    if raw and 1e12 <= value < 4.1e12:
+        return value
+    return fallback
 
 
 def _parse_assistant(content: Any) -> tuple[str, str, list[dict]]:
@@ -129,6 +146,12 @@ class WebSession:
         self.updated_at = time.time()
         self.first_user_ts: float = 0.0
 
+        # 当前模型（按会话保存，切换后下一轮生效）
+        from .agent import ModelHolder
+
+        self.model_holder = ModelHolder()
+        self.model_key: str = DEFAULT_MODEL_KEY
+
         self.display_messages: list[dict] = []
         self.agent: Optional[Any] = None
         self.pi_session: Optional[Session] = None
@@ -157,15 +180,44 @@ class WebSession:
         if self.agent is None:
             from .agent import create_agent
 
-            self.agent = create_agent()
+            self.agent = create_agent(self.model_holder)
             if self.pi_session is None:
                 self.load_session()
+            # 新会话此时才建好存储：把已选的模型落盘
+            self._persist_model_key()
             self.agent.state.messages = self.build_context()
             self._persisted_count = len(self.agent.state.messages)
             if not self._subscribed:
                 self.agent.subscribe(self.on_event)
                 self._subscribed = True
         return self.agent
+
+    # ------------------------------------------------------------ 模型切换
+
+    def switch_model(self, key: str) -> dict:
+        """切换本会话使用的模型；运行中不允许切换。"""
+        entry = self.model_holder.switch(key)
+        self.model_key = entry["key"]
+        if self.agent is not None:
+            self.agent.state.model = entry["model"]
+        self._persist_model_key()
+        return entry
+
+    def _persist_model_key(self) -> None:
+        """把模型键写进会话元数据（JSONL 首行），重启后可恢复。"""
+        storage = getattr(self.pi_session, "storage", None)
+        if storage is None:
+            return
+        try:
+            metadata = getattr(storage, "_metadata", None)
+            if not isinstance(metadata, dict):
+                return
+            metadata["model_key"] = self.model_key
+            save = getattr(storage, "_save", None)
+            if callable(save):
+                save()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("写入模型选择失败: %s", exc)
 
     def dispose(self) -> None:
         """删除会话前调用：停止生成、断开订阅。"""
@@ -283,6 +335,8 @@ class WebSession:
                         "role": "assistant",
                         "text": self._pending_text,
                         "thinking": self._pending_thinking,
+                        "usage": payload.get("usage") or {},
+                        "model": payload.get("model") or "",
                         "ts": now,
                     }
                 )
@@ -316,11 +370,28 @@ class WebSession:
         self.updated_at = self.storage_path.stat().st_mtime
         self.created_at = self.updated_at
 
+        # 恢复上次选择的模型
+        try:
+            metadata = self.pi_session.storage.get_metadata() or {}
+            saved_key = metadata.get("model_key")
+            if saved_key:
+                self.switch_model(str(saved_key))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("恢复模型选择失败: %s", exc)
+
         try:
             entries = list(self.pi_session.get_entries())
         except Exception as exc:  # noqa: BLE001
             log.warning("读取会话失败 %s: %s", self.id, exc)
             entries = []
+
+        if entries:
+            first_msg = _f(entries[0], "data", None)
+            first_ts = _message_ts(
+                first_msg, _ts_ms(_f(entries[0], "timestamp", ""))
+            ) / 1000
+            if first_ts > 0:
+                self.created_at = first_ts
 
         for entry in entries:
             etype = _f(entry, "type", "")
@@ -347,6 +418,8 @@ class WebSession:
                 continue
             role = _f(msg, "role", "")
             content = _f(msg, "content", None)
+            # 消息自带的时间比批量落盘时的条目时间可靠得多
+            ts = _message_ts(msg, ts)
 
             if role == "user":
                 text = _parse_text_blocks(content)
@@ -365,6 +438,8 @@ class WebSession:
                             "role": "assistant",
                             "text": text,
                             "thinking": thinking,
+                            "usage": usage_dict(msg),
+                            "model": _f(msg, "model", "") or "",
                             "ts": ts,
                         }
                     )
