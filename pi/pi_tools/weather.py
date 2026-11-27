@@ -5,6 +5,7 @@
 from pi.pi_ai import TextContent
 from pi.pi_agent_core import AgentToolResult
 
+import asyncio
 import aiohttp
 from typing import Optional
 
@@ -50,9 +51,16 @@ class GetCityWeatherTool:
         city = params['city']
         url = f"https://wttr.in/{city}?format=%l:+%c+%t+%h+%w&lang=zh"
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                text = await resp.text()
+        # 必须显式设超时：aiohttp 默认 5 分钟，会让前端工具卡长时间停在「运行中」
+        timeout = aiohttp.ClientTimeout(total=15, connect=8)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    text = await resp.text()
+        except asyncio.TimeoutError:
+            return AgentToolResult(content=[TextContent(text=f"天气查询超时（15s）：{city}")])
+        except aiohttp.ClientError as exc:
+            return AgentToolResult(content=[TextContent(text=f"天气查询失败：{exc}")])
 
         result = text.strip() or f"未找到城市：{city}"
         print(f"\n[工具执行] {result}")

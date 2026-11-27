@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pi Agent</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="rail-head">
+      <div class="brand">
+        <span class="brand-mark">π</span>
+        <span class="brand-text">Pi Agent</span>
+      </div>
+
+      <nav class="rail-nav">
+        <button id="navChat" class="rail-nav-item active" type="button">
+          <span class="rail-nav-ico">💬</span> 对话
+        </button>
+        <button id="navModels" class="rail-nav-item" type="button">
+          <span class="rail-nav-ico">◈</span> 模型
+        </button>
+      </nav>
+
+      <button id="newBtn" class="btn primary block" type="button">
+        <span class="plus">＋</span> 新对话
+      </button>
+      <label class="search-box">
+        <span class="search-ico">⌕</span>
+        <input id="searchInput" type="text" placeholder="搜索对话" autocomplete="off">
+      </label>
+    </div>
+    <div id="sessionList" class="rail-list"></div>
+    <div class="rail-foot">
+      <span id="connDot" class="conn-dot"></span>
+      <span id="connText">连接中…</span>
+    </div>
+  </aside>
+
+  <main id="main" class="main">
+    <header class="topbar">
+      <div class="topbar-main">
+        <div id="title" class="topbar-title">新对话</div>
+        <div id="subtitle" class="topbar-sub">工具调用 · 流式输出</div>
+      </div>
+      <div class="topbar-actions">
+        <span id="busyBadge" class="badge amber hidden">生成中</span>
+        <button id="stopBtn" class="btn danger hidden" type="button">停止</button>
+        <button id="clearBtn" class="btn ghost" type="button" title="删除当前对话">删除</button>
+      </div>
+    </header>
+
+    <div id="scroll" class="scroll">
+      <section id="welcome" class="welcome">
+        <div class="mascot" aria-hidden="true"><span></span><span></span></div>
+        <h1 class="welcome-title">嗨，我是你的智能助手</h1>
+        <p class="welcome-sub">查天气、联网搜索、读写文件，说出你的想法就行～</p>
+        <div class="quick-section">
+          <div class="quick-title">快速开始</div>
+          <div class="quick-cards" id="quickCards"></div>
+        </div>
+      </section>
+      <div id="messages" class="messages"></div>
+    </div>
+
+    <section id="modelsView" class="models-view">
+      <div class="models-head">
+        <div>
+          <h2 class="models-title">模型</h2>
+          <p class="models-sub" id="modelsSub">已从 .env 加载的模型，可逐个测试连通性</p>
+        </div>
+        <button id="testAllBtn" class="btn" type="button">全部测试</button>
+      </div>
+      <div id="modelList" class="model-list"></div>
+      <div class="models-hint">
+        测试会向 <code>/models</code> 发一次只读请求；该接口不存在时退回
+        <code>/chat/completions</code>（<code>max_tokens=1</code>）。
+        鉴权依次尝试 <code>Authorization: Bearer</code>、裸 <code>KEY</code>、<code>api-key</code>。
+      </div>
+    </section>
+
+    <div class="bottom">
+      <div id="toolsPop" class="popover hidden">
+        <div class="popover-head">
+          <span>可用工具 <b id="toolsCount"></b></span>
+          <button id="toolsClose" class="pop-x" type="button" title="关闭">✕</button>
+        </div>
+        <div id="toolsList" class="popover-body"></div>
+      </div>
+
+      <div class="composer">
+        <div class="composer-chips">
+          <label class="chip chip-select" title="选择模型">
+            <span class="chip-ico">◈</span>
+            <select id="modelSelect" aria-label="选择模型"></select>
+            <span class="chip-caret">▾</span>
+          </label>
+          <button id="toolChip" class="chip chip-btn" type="button" title="查看可用工具">
+            <span class="chip-ico">🛠</span>
+            <span id="toolChipText">工具</span>
+          </button>
+        </div>
+        <textarea id="input" class="composer-input" rows="1"
+          placeholder="和 AI 说点什么…例如：北京明天的天气怎么样"></textarea>
+        <div class="composer-actions">
+          <span class="hint">Enter 发送 · Shift+Enter 换行</span>
+          <span class="grow"></span>
+          <button id="sendBtn" class="send-btn" type="button" title="发送">→</button>
+        </div>
+      </div>
+      <div class="disclaimer">AI 生成内容，请查核</div>
+    </div>
+  </main>
+</div>
+<script src="/static/app.js" defer></script>
+</body>
+</html>
